@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1d4ed8">
+<title>会议发布与参会确认系统</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<div id="app"><div class="boot">正在加载…</div></div>
+<div id="toast" class="toast-box"></div>
+
+<!-- Supabase 客户端库（唯一的外部依赖；其余代码含 Excel、二维码全部内置） -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script>
+/* CDN 被墙/断网时的兜底提示 */
+window.addEventListener('load', function () {
+  if (typeof window.supabase === 'undefined') {
+    var b = document.querySelector('.boot');
+    if (b) {
+      b.innerHTML = '无法加载 Supabase 客户端库（cdn.jsdelivr.net）。<br>' +
+        '请检查网络后刷新；或把 supabase.js 下载到本地后修改 index.html 的引用路径。';
+      b.style.color = '#b91c1c';
+    }
+  }
+});
+</script>
+
+<script src="config/config.js"></script>
+<script src="config/seed.js"></script>
+<script src="js/util.js"></script>
+<script src="js/xlsx.js"></script>
+<script src="js/qr.js"></script>
+<script src="js/parser.js"></script>
+<script src="js/db.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
