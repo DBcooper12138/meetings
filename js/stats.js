@@ -1,8 +1,12 @@
 /* ============================================================
- *  stats.js —— 统计面板
- *   ① 按会议：选一场会议 → 参会/不参会/待确认 + 明细 + 导出
- *   ② 按人员：选一个人 → 参加过哪些会、总参会次数、请假次数、出席率 + 导出
- *   ③ 导出：单场 / 全部 / 总览 / 名单 / 人员统计
+ *  stats.js —— 统计信息
+ *
+ *   ① 按会议：时间段 + 关键字 + （超管）按用户 筛选会议
+ *              → 汇总卡片 + 单场明细 + 导出
+ *   ② 按人员：选一个人，可再叠加时间段
+ *              → 被邀请/参会/请假/未确认/出席率 + 逐场明细 + 导出
+ *
+ *   超级管理员：可看全部用户的会议，也可只看某一个用户的。
  * ============================================================ */
 (function (root) {
   'use strict';
@@ -16,63 +20,122 @@
   function q(id) { return MS().q(id); }
   function h(s) { return MS().h(s); }
   function toast(m, t) { MS().toast(m, t); }
+  function S() { return MS().state; }
 
-  function dataPair(meetingId) {
-    var S = MS().state;
-    var m = (S.meetings || []).filter(function (x) { return x.id === meetingId; })[0];
-    if (!m) return null;
-    var rs = (S.responsesCache && S.responsesCache[meetingId]) || [];
-    return { m: m, rs: rs };
+  /* ================= 筛选 ================= */
+  function isSuper() { return !!(S().profile && S().profile.is_super); }
+
+  function filteredMeetings() {
+    var st = S();
+    var from = st.statsFrom || '';
+    var to = st.statsTo || '';
+    var kw = String(st.statsKw || '').trim().toLowerCase();
+    var owner = st.statsOwner || '';
+
+    return (st.meetings || []).filter(function (m) {
+      var d = m.meet_date || '';
+      if (from && (!d || d < from)) return false;
+      if (to && (!d || d > to)) return false;
+      if (owner && m.owner_id !== owner) return false;
+      if (kw) {
+        var hay = [m.title, m.location, m.convene_dept, m.host, m.contact]
+          .map(function (x) { return String(x || ''); }).join(' ').toLowerCase();
+        if (hay.indexOf(kw) < 0) return false;
+      }
+      return true;
+    });
+  }
+
+  function responsesOf(meetingId) {
+    return (S().responsesCache && S().responsesCache[meetingId]) || [];
   }
 
   function personList() {
-    var S = MS().state;
-    return P().buildPersonStats(S.meetings || [], S.allResponses || []);
+    return P().buildPersonStats(filteredMeetings(), S().allResponses || []);
+  }
+
+  function hasFilter() {
+    var st = S();
+    return !!(st.statsFrom || st.statsTo || String(st.statsKw || '').trim() || st.statsOwner);
   }
 
   /* ================= 视图 ================= */
   function viewStats() {
-    var S = MS().state;
-    var tab = S.statsTab || 'meeting';
-    var body = '';
-
-    var tabs = '<div class="btn-row" style="margin-bottom:14px">' +
+    var tab = S().statsTab || 'meeting';
+    var tabBar = '<div class="btn-row" style="margin-bottom:12px">' +
       '<button class="btn ' + (tab === 'meeting' ? '' : 'ghost') + ' sm" data-stab="meeting">按会议统计</button>' +
       '<button class="btn ' + (tab === 'person' ? '' : 'ghost') + ' sm" data-stab="person">按人员统计</button>' +
       '<span class="sp" style="flex:1"></span>' +
-      '<button class="btn ghost sm" id="st-export-all">⤓ 导出全部会议</button>' +
-      '<button class="btn ghost sm" id="st-export-summary">⤓ 导出总览</button>' +
+      '<button class="btn ghost sm" id="st-export-all">⤓ 导出当前会议集</button>' +
       '<button class="btn ghost sm" id="st-export-roster">⤓ 导出名单</button>' +
       '</div>';
 
-    if (tab === 'meeting') body = viewByMeeting();
-    else body = viewByPerson();
+    var ps = MS().planState ? MS().planState() : { canExport: true };
+    var exportNotice = ps.canExport ? '' :
+      '<div class="notice warn" style="margin-bottom:12px">' +
+      '导出属于<b>会员功能</b>：你当前套餐未开通或已过期，统计仍可正常查看，' +
+      '但点击导出会提示购买。<a href="#/account">去「我的账户」看看套餐 →</a></div>';
 
-    return MS().shell('stats', '统计', '', tabs + body);
+    return MS().shell('stats', '统计信息', '', exportNotice + filterBar() + tabBar +
+      (tab === 'meeting' ? viewByMeeting() : viewByPerson()));
   }
 
+  function filterBar() {
+    var st = S();
+    var owners = st.statsOwners || [];
+    var ownerSel = '';
+    if (isSuper()) {
+      ownerSel = '<select class="input" id="st-owner" style="width:190px">' +
+        '<option value="">全部用户</option>' +
+        owners.map(function (u) {
+          return '<option value="' + h(u.id) + '"' + (st.statsOwner === u.id ? ' selected' : '') + '>' +
+            h(u.name + '（' + (u.emp_no || '无工号') + '）') + '</option>';
+        }).join('') + '</select>';
+    }
+    return '<div class="card" style="margin-bottom:14px"><div class="card-b" ' +
+      'style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">' +
+      '<span class="hint">会议时间段</span>' +
+      '<input type="date" class="input" id="st-from" style="width:150px" value="' + h(st.statsFrom || '') + '">' +
+      '<span class="hint">至</span>' +
+      '<input type="date" class="input" id="st-to" style="width:150px" value="' + h(st.statsTo || '') + '">' +
+      '<input class="input" id="st-kw" style="width:200px" placeholder="关键字：会议名/地点/部门" value="' + h(st.statsKw || '') + '">' +
+      ownerSel +
+      '<button class="btn ghost sm" id="st-clear">清除筛选</button>' +
+      '<span class="sp" style="flex:1"></span>' +
+      '<span class="hint">共筛选出 <b>' + filteredMeetings().length + '</b> 场会议' +
+        (isSuper() && !st.statsOwner ? '（全部用户）' : '') + '</span>' +
+      '</div></div>';
+  }
+
+  /* ---------------- 按会议 ---------------- */
   function viewByMeeting() {
-    var S = MS().state;
-    var meetings = (S.meetings || []).slice().sort(function (a, b) {
+    var meetings = filteredMeetings().slice().sort(function (a, b) {
       return String(b.meet_date || '') < String(a.meet_date || '') ? -1 : 1;
     });
     if (!meetings.length) {
-      return '<div class="card"><div class="empty"><span class="big">📊</span>还没有会议，先去发布一场</div></div>';
+      return '<div class="card"><div class="empty"><span class="big">📊</span>' +
+        (hasFilter() ? '没有符合筛选条件的会议' : '还没有会议，先去发布一场') + '</div></div>';
     }
-    var sel = S.statsMeetingId || meetings[0].id;
+
+    var sel = S().statsMeetingId || meetings[0].id;
     if (!meetings.some(function (m) { return m.id === sel; })) sel = meetings[0].id;
+
+    // 筛选集合的整体汇总
+    var total = { invited: 0, yes: 0, no: 0, pending: 0 };
+    meetings.forEach(function (m) {
+      var st = P().buildAttendance(m, responsesOf(m.id)).stats;
+      total.invited += st.invited; total.yes += st.yes; total.no += st.no; total.pending += st.pending;
+    });
 
     var opts = meetings.map(function (m) {
       return '<option value="' + h(m.id) + '"' + (m.id === sel ? ' selected' : '') + '>' +
         h((m.meet_date || '未定日期') + '　' + (m.title || '未命名会议')) + '</option>';
     }).join('');
 
-    var pair = dataPair(sel);
-    if (!pair) return '<div class="card"><div class="empty">会议数据异常</div></div>';
-
-    var att = P().buildAttendance(pair.m, pair.rs);
-    var st = att.stats;
-    var filter = S.statsFilter || 'all';
+    var m = meetings.filter(function (x) { return x.id === sel; })[0];
+    var att = P().buildAttendance(m, responsesOf(m.id));
+    var st1 = att.stats;
+    var filter = S().statsFilter || 'all';
     var rows = P().sortRows(att.rows).filter(function (r) {
       if (filter === 'yes') return r.status === 'yes';
       if (filter === 'no') return r.status === 'no';
@@ -95,20 +158,29 @@
     }).join('');
 
     return '' +
-      '<div class="card" style="margin-bottom:14px"><div class="card-b" style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">' +
+      '<div class="grid c3" style="margin-bottom:14px">' +
+        '<div class="stat"><div class="n">' + meetings.length + '</div><div class="t">筛选出的会议数</div></div>' +
+        '<div class="stat blue"><div class="n">' + total.invited + '</div><div class="t">受邀人次合计</div></div>' +
+        '<div class="stat green"><div class="n">' + total.yes + '</div><div class="t">参会人次合计</div></div>' +
+        '<div class="stat red"><div class="n">' + total.no + '</div><div class="t">请假人次合计</div></div>' +
+        '<div class="stat amber"><div class="n">' + total.pending + '</div><div class="t">未确认人次合计</div></div>' +
+      '</div>' +
+
+      '<div class="card" style="margin-bottom:14px"><div class="card-b" ' +
+        'style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">' +
         '<span class="hint">选择会议：</span>' +
-        '<select class="input" id="st-meeting" style="flex:1;min-width:260px;max-width:520px">' + opts + '</select>' +
+        '<select class="input" id="st-meeting" style="flex:1;min-width:240px;max-width:520px">' + opts + '</select>' +
         '<button class="btn sm" id="st-do-export">⤓ 导出本场</button>' +
       '</div></div>' +
 
       '<div class="grid c3" style="margin-bottom:14px">' +
-        '<div class="stat blue"><div class="n">' + st.invited + '</div><div class="t">受邀人数</div></div>' +
-        '<div class="stat green"><div class="n">' + st.yes + '</div><div class="t">确认参会</div></div>' +
-        '<div class="stat red"><div class="n">' + st.no + '</div><div class="t">确认不参会</div></div>' +
-        '<div class="stat amber"><div class="n">' + st.pending + '</div><div class="t">尚未确认</div></div>' +
+        '<div class="stat blue"><div class="n">' + st1.invited + '</div><div class="t">本场受邀</div></div>' +
+        '<div class="stat green"><div class="n">' + st1.yes + '</div><div class="t">确认参会</div></div>' +
+        '<div class="stat red"><div class="n">' + st1.no + '</div><div class="t">确认不参会</div></div>' +
+        '<div class="stat amber"><div class="n">' + st1.pending + '</div><div class="t">尚未确认</div></div>' +
       '</div>' +
 
-      '<div class="card"><div class="card-h"><h2>' + h(pair.m.title || '会议') + '　明细</h2>' +
+      '<div class="card"><div class="card-h"><h2>' + h(m.title || '会议') + '　明细</h2>' +
         '<span class="sp" style="flex:1"></span>' +
         [['all', '全部'], ['yes', '已参会'], ['no', '已请假'], ['pending', '待确认']].map(function (t) {
           return '<button class="btn ' + (filter === t[0] ? '' : 'ghost') + ' sm" data-sfilter="' + t[0] + '">' + t[1] + '</button>';
@@ -127,24 +199,25 @@
     return '<span class="tag amber">待确认</span>';
   }
 
+  /* ---------------- 按人员 ---------------- */
   function viewByPerson() {
-    var S = MS().state;
     var list = personList();
     if (!list.length) {
-      return '<div class="card"><div class="empty"><span class="big">👤</span>还没有参会人数据</div></div>';
+      return '<div class="card"><div class="empty"><span class="big">👤</span>' +
+        (hasFilter() ? '该筛选范围内没有参会人数据' : '还没有参会人数据') + '</div></div>';
     }
 
-    var kw = (S.statsPersonKw || '').trim().toLowerCase();
+    var kw = String(S().statsPersonKw || '').trim().toLowerCase();
     var filtered = !kw ? list : list.filter(function (p) {
       return (p.name || '').toLowerCase().indexOf(kw) >= 0 ||
              (p.dept || '').toLowerCase().indexOf(kw) >= 0 ||
              (String(p.emp_no || '')).toLowerCase().indexOf(kw) >= 0;
     });
 
-    var selKey = S.statsPerson || (filtered[0] && filtered[0].key);
+    var selKey = S().statsPerson || (filtered[0] && filtered[0].key);
     var person = filtered.filter(function (p) { return p.key === selKey; })[0] || filtered[0];
 
-    var listHtml = filtered.slice(0, 300).map(function (p) {
+    var listHtml = filtered.slice(0, 500).map(function (p) {
       var on = person && p.key === person.key;
       return '<div class="pl-item ' + (on ? 'on' : '') + '" data-person="' + h(p.key) + '">' +
         '<div class="pl-main"><b>' + h(p.name) + '</b>' +
@@ -186,8 +259,9 @@
             '<div class="stat ' + (person.rate >= 80 ? 'green' : person.rate >= 50 ? 'amber' : 'red') + '">' +
               '<div class="n">' + person.rate + '%</div><div class="t">出席率（占已回复）</div></div>' +
           '</div>' +
-          '<div class="hint" style="margin-top:12px">出席率 = 已参会 /（已参会 + 已请假）。' +
-          '未确认的会议不计入分母。</div>' +
+          '<div class="hint" style="margin-top:12px">' +
+            (hasFilter() ? '以上数字**只统计当前筛选范围内**的会议。' : '') +
+            '出席率 = 已参会 ÷（已参会 + 已请假），未确认不计入分母。</div>' +
         '</div></div>' +
 
         '<div class="card"><div class="card-h"><h2>参会明细（' + person.meetings.length + ' 场）</h2></div>' +
@@ -199,9 +273,10 @@
     }
 
     return '' +
-      '<div class="card" style="margin-bottom:14px"><div class="card-b" style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">' +
-        '<input class="input" id="st-pkw" style="flex:1;min-width:240px;max-width:420px" ' +
-          'placeholder="搜索姓名 / 工号 / 部门" value="' + h(S.statsPersonKw || '') + '">' +
+      '<div class="card" style="margin-bottom:14px"><div class="card-b" ' +
+        'style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">' +
+        '<input class="input" id="st-pkw" style="flex:1;min-width:220px;max-width:380px" ' +
+          'placeholder="搜索姓名 / 工号 / 部门" value="' + h(S().statsPersonKw || '') + '">' +
         '<span class="hint">共 ' + list.length + ' 位参会人</span>' +
         '<span class="sp" style="flex:1"></span>' +
         '<button class="btn ghost sm" id="st-person-all">⤓ 导出全体人员统计</button>' +
@@ -216,41 +291,72 @@
 
   /* ================= 绑定 ================= */
   function bindStats() {
+    // 超级管理员：加载用户列表供筛选
+    if (isSuper() && !S().statsOwners) {
+      DB().admin.listUsers().then(function (us) {
+        S().statsOwners = us || [];
+        MS().render();
+      }).catch(function () { S().statsOwners = []; });
+    }
+
     document.querySelectorAll('[data-stab]').forEach(function (b) {
       b.addEventListener('click', function () {
-        MS().state.statsTab = b.getAttribute('data-stab');
+        S().statsTab = b.getAttribute('data-stab');
         MS().render();
       });
     });
 
+    function applyFilter() {
+      S().statsFrom = (q('st-from') || {}).value || '';
+      S().statsTo = (q('st-to') || {}).value || '';
+      S().statsKw = (q('st-kw') || {}).value || '';
+      var ow = q('st-owner');
+      if (ow) S().statsOwner = ow.value;
+      MS().render();
+    }
+
+    var from = q('st-from'), to = q('st-to');
+    if (from) from.addEventListener('change', applyFilter);
+    if (to) to.addEventListener('change', applyFilter);
+    var kw = q('st-kw');
+    if (kw) kw.addEventListener('change', applyFilter);
+    var ow = q('st-owner');
+    if (ow) ow.addEventListener('change', applyFilter);
+    var clr = q('st-clear');
+    if (clr) clr.addEventListener('click', function () {
+      S().statsFrom = ''; S().statsTo = ''; S().statsKw = ''; S().statsOwner = '';
+      MS().render();
+    });
+
     var sel = q('st-meeting');
     if (sel) sel.addEventListener('change', function () {
-      MS().state.statsMeetingId = sel.value;
+      S().statsMeetingId = sel.value;
       MS().render();
     });
     document.querySelectorAll('[data-sfilter]').forEach(function (b) {
       b.addEventListener('click', function () {
-        MS().state.statsFilter = b.getAttribute('data-sfilter');
+        S().statsFilter = b.getAttribute('data-sfilter');
         MS().render();
       });
     });
-    var exp1 = q('st-do-export');
-    if (exp1) exp1.addEventListener('click', function () {
-      var pair = dataPair(MS().state.statsMeetingId || (MS().state.meetings[0] || {}).id);
-      if (pair) exportMeeting(pair.m, pair.rs);
+    var e1 = q('st-do-export');
+    if (e1) e1.addEventListener('click', function () {
+      var ms = filteredMeetings();
+      var m = ms.filter(function (x) { return x.id === (S().statsMeetingId || (ms[0] || {}).id); })[0];
+      if (m) exportMeeting(m, responsesOf(m.id));
     });
 
     var pkw = q('st-pkw');
     if (pkw) pkw.addEventListener('input', function () {
       var pos = pkw.selectionStart;
-      MS().state.statsPersonKw = pkw.value;
+      S().statsPersonKw = pkw.value;
       MS().render();
       var el = q('st-pkw');
       if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) {} }
     });
     document.querySelectorAll('[data-person]').forEach(function (el) {
       el.addEventListener('click', function () {
-        MS().state.statsPerson = el.getAttribute('data-person');
+        S().statsPerson = el.getAttribute('data-person');
         MS().render();
       });
     });
@@ -258,7 +364,7 @@
     var pe = q('st-person-export');
     if (pe) pe.addEventListener('click', function () {
       var list = personList();
-      var p = list.filter(function (x) { return x.key === MS().state.statsPerson; })[0] || list[0];
+      var p = list.filter(function (x) { return x.key === S().statsPerson; })[0] || list[0];
       if (p) exportPerson(p);
     });
     var pa = q('st-person-all');
@@ -266,13 +372,19 @@
 
     var ea = q('st-export-all');
     if (ea) ea.addEventListener('click', exportAllMeetings);
-    var es = q('st-export-summary');
-    if (es) es.addEventListener('click', exportSummaryAll);
     var er = q('st-export-roster');
     if (er) er.addEventListener('click', exportRoster);
   }
 
   /* ================= 导出 ================= */
+  /* 导出的统一拦截：免费/过期用户不能导出（与后端 check_meeting_allowed 的口径一致） */
+  function guardExport() {
+    var ps = MS().planState ? MS().planState() : { canExport: true };
+    if (ps.canExport) return true;
+    MS().requireExport();
+    return false;
+  }
+
   function xlsxBlob(bytes) {
     return new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   }
@@ -284,13 +396,13 @@
     };
   }
   function allPairs() {
-    var S = MS().state;
-    return (S.meetings || []).map(function (m) {
-      return { m: m, rs: (S.responsesCache && S.responsesCache[m.id]) || [] };
+    return filteredMeetings().map(function (m) {
+      return { m: m, rs: responsesOf(m.id) };
     });
   }
 
   function exportMeeting(m, rs) {
+    if (!guardExport()) return;
     try {
       var bytes = X().buildXlsx([sheetFromMeeting(m, rs)]);
       U().download(U().safeFileName('参会情况_' + (m.title || '会议') + '_' + (m.meet_date || '')) + '.xlsx', xlsxBlob(bytes));
@@ -299,8 +411,9 @@
   }
 
   function exportAllMeetings() {
+    if (!guardExport()) return;
     var pairs = allPairs();
-    if (!pairs.length) return toast('还没有会议', 'warn');
+    if (!pairs.length) return toast('当前筛选范围内没有会议', 'warn');
     try {
       var sheets = [{
         name: '总览', rows: P().summarySheetRows(pairs),
@@ -313,23 +426,11 @@
     } catch (e) { toast('导出失败：' + e.message, 'err'); }
   }
 
-  function exportSummaryAll() {
-    var pairs = allPairs();
-    if (!pairs.length) return toast('还没有会议', 'warn');
-    try {
-      var bytes = X().buildXlsx([{
-        name: '总览', rows: P().summarySheetRows(pairs),
-        colWidths: [6, 30, 14, 14, 22, 20, 10, 10, 12, 10, 9]
-      }]);
-      U().download('会议总览统计_' + U().todayISO() + '.xlsx', xlsxBlob(bytes));
-      toast('总览统计已导出', 'ok');
-    } catch (e) { toast('导出失败：' + e.message, 'err'); }
-  }
-
   function exportRoster() {
+    if (!guardExport()) return;
     try {
       var bytes = X().buildXlsx([{
-        name: '人员名单', rows: P().rosterSheetRows(MS().state.roster || []),
+        name: '人员名单', rows: P().rosterSheetRows(S().roster || []),
         colWidths: [7, 30, 14, 12, 12, 16, 24]
       }]);
       U().download('人员名单_' + U().todayISO() + '.xlsx', xlsxBlob(bytes));
@@ -338,6 +439,7 @@
   }
 
   function exportPerson(p) {
+    if (!guardExport()) return;
     try {
       var bytes = X().buildXlsx([{
         name: String(p.name).slice(0, 20) + '_参会统计',
@@ -350,6 +452,7 @@
   }
 
   function exportPersonSummary(list) {
+    if (!guardExport()) return;
     try {
       var bytes = X().buildXlsx([{
         name: '人员统计', rows: P().personSummaryRows(list),
@@ -363,8 +466,7 @@
   root.MSStats = {
     viewStats: viewStats, bindStats: bindStats,
     exportMeeting: exportMeeting, exportAllMeetings: exportAllMeetings,
-    exportSummaryAll: exportSummaryAll, exportRoster: exportRoster,
-    exportPerson: exportPerson, exportPersonSummary: exportPersonSummary,
-    personList: personList
+    exportRoster: exportRoster, exportPerson: exportPerson, exportPersonSummary: exportPersonSummary,
+    personList: personList, filteredMeetings: filteredMeetings
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

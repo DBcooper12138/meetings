@@ -417,6 +417,95 @@
       .then(function (r) { return unwrap(r, '读取充值记录') || []; });
   }
 
+  /* ================= 免费版操作配额 ================= */
+  var QUOTA_LIMIT = 10;
+
+  function quotaStatus() {
+    if (!isCloud()) {
+      var db = readLocal();
+      var me = db.profile || {};
+      var unlimited = !!(me.is_super || (me.plan_expires_at && new Date(me.plan_expires_at) > new Date()));
+      var r = me.quota_remind_used || 0, p = me.quota_promote_used || 0;
+      return Promise.resolve({
+        ok: true, unlimited: unlimited, limit: QUOTA_LIMIT,
+        remind: { used: r, left: Math.max(0, QUOTA_LIMIT - r) },
+        promote: { used: p, left: Math.max(0, QUOTA_LIMIT - p) }
+      });
+    }
+    return client().rpc('quota_status').then(function (r) { return unwrap(r, '读取配额'); });
+  }
+
+  function consumeQuota(kind) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var me = db.profile;
+      if (!me) return Promise.resolve({ ok: false, error: '请先登录' });
+      var unlimited = !!(me.is_super || (me.plan_expires_at && new Date(me.plan_expires_at) > new Date()));
+      if (unlimited) return Promise.resolve({ ok: true, unlimited: true });
+      var field = kind === 'remind' ? 'quota_remind_used' : 'quota_promote_used';
+      var used = me[field] || 0;
+      if (used >= QUOTA_LIMIT) {
+        return Promise.resolve({
+          ok: false, exhausted: true,
+          error: kind === 'remind'
+            ? '免费版「复制催办文本」已用完 10 次，购买套餐后可不限次数使用'
+            : '免费版「一键加入名单」已用完 10 次，购买套餐后可不限次数使用'
+        });
+      }
+      me[field] = used + 1;
+      db.users = db.users.map(function (u) { return u.id === me.id ? Object.assign({}, u, me) : u; });
+      writeLocal(db);
+      return Promise.resolve({ ok: true, unlimited: false, used: me[field],
+        left: Math.max(0, QUOTA_LIMIT - me[field]), limit: QUOTA_LIMIT });
+    }
+    return client().rpc('consume_quota', { p_kind: kind }).then(function (r) { return unwrap(r, '扣减配额'); });
+  }
+
+  /* 把名单外参会人一键加入名单 */
+  function promoteResponse(responseId) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var me = db.profile;
+      if (!me) return Promise.resolve({ ok: false, error: '请先登录' });
+      var resp = (db.responses || []).filter(function (x) { return x.id === responseId; })[0];
+      if (!resp) return Promise.resolve({ ok: false, error: '找不到这条参会记录' });
+      var name = String(resp.name_raw || '').trim();
+      var emp = String(resp.emp_no || '').trim();
+      var already = db.roster.some(function (p) {
+        return (emp && String(p.emp_no || '').toLowerCase() === emp.toLowerCase()) ||
+               (!emp && p.name === name && (p.dept || '') === (resp.dept || ''));
+      });
+      if (already) {
+        resp.promoted = true;
+        writeLocal(db);
+        return Promise.resolve({ ok: true, already: true, message: '这个人已经在你的名单里了' });
+      }
+      return consumeQuota('promote').then(function (q) {
+        if (!q || !q.ok) return q;
+        var d = readLocal();
+        var maxSort = d.roster.reduce(function (m, p) { return Math.max(m, p.sort_no || 0); }, 0);
+        var hit = d.roster.filter(function (p) {
+          return p.name === name && (p.dept || '') === (resp.dept || '') && (p.category || '') === (resp.category || '');
+        })[0];
+        if (hit) {
+          if (emp && !hit.emp_no) hit.emp_no = emp;
+          hit.active = true;
+        } else {
+          d.roster.push({
+            id: uuid(), owner_id: me.id, emp_no: emp, dept: resp.dept || '',
+            category: resp.category || '', name: name, phone: '', note: '',
+            sort_no: maxSort + 1, active: true, created_at: nowISO()
+          });
+        }
+        (d.responses || []).forEach(function (x) { if (x.id === responseId) x.promoted = true; });
+        writeLocal(d);
+        return { ok: true, already: false, quota: q, added: { name: name, emp_no: emp } };
+      });
+    }
+    return client().rpc('promote_response_to_roster', { p_response_id: responseId })
+      .then(function (r) { return unwrap(r, '加入名单'); });
+  }
+
   /* ================= 名单 ================= */
   function listRoster() {
     if (!isCloud()) {
@@ -526,8 +615,16 @@
       var db = readLocal();
       var me = db.profile;
       if (!me) throw new Error('请先登录');
-      if (!me.is_super && (!me.plan_expires_at || new Date(me.plan_expires_at).getTime() <= Date.now())) {
-        throw new Error('套餐未开通或已过期，请先在「我的账户」购买套餐');
+      var planOk = me.is_super || (me.plan_expires_at && new Date(me.plan_expires_at).getTime() > Date.now());
+      if (!planOk) {
+        var mine = db.meetings.filter(function (x) { return x.owner_id === me.id; });
+        if (mine.length >= 1) {
+          throw new Error('免费额度已用完：未开通套餐最多发布 1 场会议，请到「我的账户」购买套餐后继续');
+        }
+        if ((m.invite || []).length > 20) {
+          throw new Error('免费额度限制：单场最多邀请 20 人（当前 ' + (m.invite || []).length +
+            ' 人），购买套餐后不限人数');
+        }
       }
       var row = Object.assign({
         id: uuid(), owner_id: me.id, share_token: randToken(12),
@@ -616,7 +713,7 @@
       .then(function (r) { return unwrap(r, '打开会议'); });
   }
 
-  function submitResponse(token, name, attending, reason, note) {
+  function submitResponse(token, name, attending, reason, note, empNo) {
     if (!isCloud()) {
       var db = readLocal();
       var m = db.meetings.filter(function (x) { return x.share_token === token; })[0];
@@ -624,13 +721,21 @@
       if (m.deadline && Date.now() > new Date(m.deadline).getTime()) {
         return Promise.resolve({ ok: false, error: '本次填报已截止，如需变更请联系会议联系人' });
       }
+      var emp = String(empNo || '').replace(/\s+/g, '').toLowerCase();
       var key = String(name).replace(/\s+/g, '').toLowerCase();
-      var hit = (m.invite || []).filter(function (x) {
-        return String(x.name).replace(/\s+/g, '').toLowerCase() === key;
-      })[0];
-      var cur = db.responses.filter(function (r) { return r.meeting_id === m.id && r.name_key === key; })[0];
+      var invite = m.invite || [];
+      var hit = emp
+        ? invite.filter(function (x) { return String(x.emp_no || '').replace(/\s+/g, '').toLowerCase() === emp; })[0]
+        : null;
+      if (!hit) {
+        hit = invite.filter(function (x) {
+          return String(x.name).replace(/\s+/g, '').toLowerCase() === key;
+        })[0];
+      }
+      var rowKey = emp || key;
+      var cur = db.responses.filter(function (r) { return r.meeting_id === m.id && r.name_key === rowKey; })[0];
       var row = {
-        id: cur ? cur.id : uuid(), meeting_id: m.id, name_key: key, name_raw: name,
+        id: cur ? cur.id : uuid(), meeting_id: m.id, name_key: rowKey, name_raw: name, emp_no: emp,
         dept: hit ? hit.dept : '', category: hit ? hit.category : '',
         attending: !!attending, reason: reason || '', note: note || '',
         on_list: !!hit, updated_at: nowISO(),
@@ -640,7 +745,7 @@
       db.responses.push(row);
       writeLocal(db);
       return Promise.resolve({
-        ok: true, attending: row.attending, name: row.name_raw, on_list: row.on_list,
+        ok: true, attending: row.attending, name: row.name_raw, emp_no: row.emp_no, on_list: row.on_list,
         updated_at: row.updated_at,
         message: row.attending ? '已记录：您将按时参会' : '已记录：您不参会'
       });
@@ -648,24 +753,30 @@
     return client().rpc('submit_response', {
       p_token: token, p_name: name, p_attending: !!attending,
       p_reason: reason || '', p_note: note || '',
-      p_ua: (typeof navigator !== 'undefined' ? navigator.userAgent : '')
+      p_ua: (typeof navigator !== 'undefined' ? navigator.userAgent : ''),
+      p_emp_no: empNo || ''
     }).then(function (r) { return unwrap(r, '提交回执'); });
   }
 
-  function myResponse(token, name) {
+  function myResponse(token, name, empNo) {
     if (!isCloud()) {
       var db = readLocal();
       var m = db.meetings.filter(function (x) { return x.share_token === token; })[0];
       if (!m) return Promise.resolve({ ok: false, error: '链接无效' });
+      var emp = String(empNo || '').replace(/\s+/g, '').toLowerCase();
       var key = String(name).replace(/\s+/g, '').toLowerCase();
-      var row = db.responses.filter(function (r) { return r.meeting_id === m.id && r.name_key === key; })[0];
+      var row = (emp ? db.responses.filter(function (r) {
+        return r.meeting_id === m.id && (r.name_key === emp || String(r.emp_no || '') === emp);
+      })[0] : null) || db.responses.filter(function (r) {
+        return r.meeting_id === m.id && r.name_key === key;
+      })[0];
       if (!row) return Promise.resolve({ ok: true, found: false });
       return Promise.resolve({
         ok: true, found: true, attending: row.attending,
-        reason: row.reason, note: row.note, updated_at: row.updated_at
+        reason: row.reason, note: row.note, updated_at: row.updated_at, emp_no: row.emp_no
       });
     }
-    return client().rpc('my_response', { p_token: token, p_name: name })
+    return client().rpc('my_response', { p_token: token, p_name: name, p_emp_no: empNo || '' })
       .then(function (r) { return unwrap(r, '读取回执'); });
   }
 
@@ -884,6 +995,7 @@
     listPlans: listPlans, listWalletLogs: listWalletLogs,
     purchasePlan: purchasePlan, requestRecharge: requestRecharge, listMyRecharges: listMyRecharges,
     listRoster: listRoster, insertRoster: insertRoster, updateRoster: updateRoster, deleteRoster: deleteRoster,
+    quotaStatus: quotaStatus, consumeQuota: consumeQuota, promoteResponse: promoteResponse,
     listMeetings: listMeetings, getMeeting: getMeeting, createMeeting: createMeeting,
     updateMeeting: updateMeeting, deleteMeeting: deleteMeeting,
     listResponses: listResponses, listAllResponses: listAllResponses, deleteResponse: deleteResponse,

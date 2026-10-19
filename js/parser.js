@@ -92,30 +92,47 @@
 
   function buildAttendance(meeting, responses) {
     responses = responses || [];
-    var map = Object.create(null);
-    responses.forEach(function (r) { map[r.name_key] = r; });
+    // 两个索引：既支持按工号匹配（同名不同人也分得清），也兼容老的按姓名匹配
+    var byEmp = Object.create(null), byName = Object.create(null);
+    responses.forEach(function (r) {
+      var e = nameKey(r.emp_no);
+      if (e) byEmp[e] = r;
+      var n = nameKey(r.name_raw);
+      if (n) byName[n] = r;
+    });
 
     var invite = (meeting && meeting.invite) || [];
     var used = Object.create(null);
 
     var invited = invite.map(function (p) {
-      var k = nameKey(p.name);
-      used[k] = 1;
-      var r = map[k];
+      var empKey = nameKey(p.emp_no);
+      var nameK = nameKey(p.name);
+      var r = (empKey && byEmp[empKey]) || byName[nameK] || null;
+      if (r) {
+        if (empKey) used['e:' + empKey] = 1;
+        used['n:' + nameK] = 1;
+      }
       return {
         name: p.name, emp_no: p.emp_no || '', dept: p.dept || '', category: p.category || '',
         status: r ? (r.attending ? 'yes' : 'no') : 'pending',
         reason: r ? (r.reason || '') : '', note: r ? (r.note || '') : '',
-        updated_at: r ? r.updated_at : '', on_list: true
+        updated_at: r ? r.updated_at : '', on_list: true,
+        response_id: r ? r.id : '', promoted: r ? !!r.promoted : false
       };
     });
 
-    var outside = responses.filter(function (r) { return !used[r.name_key]; }).map(function (r) {
+    var outside = responses.filter(function (r) {
+      var e = nameKey(r.emp_no), n = nameKey(r.name_raw);
+      if (e && used['e:' + e]) return false;
+      if (n && used['n:' + n]) return false;
+      return true;
+    }).map(function (r) {
       return {
-        name: r.name_raw, emp_no: '', dept: r.dept || '', category: r.category || '',
+        name: r.name_raw, emp_no: r.emp_no || '', dept: r.dept || '', category: r.category || '',
         status: r.attending ? 'yes' : 'no',
         reason: r.reason || '', note: r.note || '',
-        updated_at: r.updated_at, on_list: false
+        updated_at: r.updated_at, on_list: false,
+        response_id: r.id, promoted: !!r.promoted
       };
     });
 
@@ -222,36 +239,59 @@
 
     var people = Object.create(null);
 
-    function ensure(name, extra) {
-      var k = nameKey(name);
+    /* 同一个人的归并键：有工号用「e:工号」，否则退回姓名。
+       这样同名不同人不会混，同一个人多种身份（如既是办公室主任又是院长）也只会算一个人。 */
+    function personKey(name, emp) {
+      var e = nameKey(emp);
+      if (e) return 'e:' + e;
+      var n = nameKey(name);
+      return n ? 'n:' + n : '';
+    }
+
+    function ensure(rows) {
+      var first = rows[0];
+      var k = personKey(first.name, first.emp_no);
       if (!k) return null;
       if (!people[k]) {
         people[k] = {
-          key: k, name: name, emp_no: '', dept: '', category: '',
+          key: k, name: first.name, emp_no: first.emp_no || '',
+          dept: first.dept || '', category: first.category || '',
           invited: 0, attended: 0, declined: 0, pending: 0, rate: 0, meetings: []
         };
       }
       var p = people[k];
-      if (extra) {
-        if (!p.emp_no && extra.emp_no) p.emp_no = extra.emp_no;
-        if (!p.dept && extra.dept) p.dept = extra.dept;
-        if (!p.category && extra.category) p.category = extra.category;
-      }
+      if (!p.emp_no && first.emp_no) p.emp_no = first.emp_no;
+      if (!p.dept && first.dept) p.dept = first.dept;
+      if (!p.category && first.category) p.category = first.category;
       return p;
     }
 
     (meetings || []).forEach(function (m) {
       var att = buildAttendance(m, byMeeting[m.id] || []);
+
+      // 同一场会议里，同一个人可能因为多种身份出现多行 —— 只算一次
+      var grouped = Object.create(null);
       att.rows.forEach(function (row) {
-        var p = ensure(row.name, row);
+        var k = personKey(row.name, row.emp_no);
+        if (!k) return;
+        (grouped[k] = grouped[k] || []).push(row);
+      });
+
+      Object.keys(grouped).forEach(function (k) {
+        var rows = grouped[k];
+        // 优先取"参加"，其次"不参加"，最后"未确认"
+        var pick = rows.filter(function (r) { return r.status === 'yes'; })[0]
+                || rows.filter(function (r) { return r.status === 'no'; })[0]
+                || rows[0];
+        var p = ensure(rows);
         if (!p) return;
         p.invited++;
-        if (row.status === 'yes') p.attended++;
-        else if (row.status === 'no') p.declined++;
+        if (pick.status === 'yes') p.attended++;
+        else if (pick.status === 'no') p.declined++;
         else p.pending++;
         p.meetings.push({
-          meeting: m, status: row.status, reason: row.reason || '',
-          note: row.note || '', updated_at: row.updated_at || '', on_list: row.on_list
+          meeting: m, status: pick.status, reason: pick.reason || '',
+          note: pick.note || '', updated_at: pick.updated_at || '', on_list: pick.on_list
         });
       });
     });

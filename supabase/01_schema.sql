@@ -74,6 +74,12 @@ create table if not exists public.profiles (
 );
 create unique index if not exists profiles_emp_no_idx on public.profiles (emp_no);
 
+-- v2.2：免费版操作配额（会员不受限）
+--   quota_remind_used  = 已用「复制催办文本」次数（免费上限 10）
+--   quota_promote_used = 已用「名单外人员一键加入名单」次数（免费上限 10）
+alter table public.profiles add column if not exists quota_remind_used  integer not null default 0;
+alter table public.profiles add column if not exists quota_promote_used integer not null default 0;
+
 -- ------------------------------------------------------------
 -- 3. 钱包流水（充值、购买套餐、管理员调整都记一笔）
 -- ------------------------------------------------------------
@@ -153,12 +159,14 @@ create table if not exists public.responses (
   meeting_id   uuid not null references public.meetings(id) on delete cascade,
   name_key     text not null,
   name_raw     text not null,
+  emp_no       text not null default '',
   dept         text not null default '',
   category     text not null default '',
   attending    boolean not null,
   reason       text not null default '',
   note         text not null default '',
   on_list      boolean not null default false,
+  promoted     boolean not null default false,
   user_agent   text not null default '',
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now(),
@@ -180,6 +188,11 @@ create index if not exists roster_owner_sort_idx on public.roster (owner_id, sor
 create index if not exists meetings_owner_idx on public.meetings (owner_id, meet_date desc);
 create index if not exists meetings_date_idx on public.meetings (meet_date desc, created_at desc);
 create index if not exists responses_meeting_idx on public.responses (meeting_id, attending);
+-- v2.1：回执增加工号，用于同名不同人时精确匹配
+alter table public.responses add column if not exists emp_no text not null default '';
+-- v2.2：是否已"一键加入名单"
+alter table public.responses add column if not exists promoted boolean not null default false;
+create index if not exists responses_emp_idx on public.responses (meeting_id, emp_no);
 
 -- ------------------------------------------------------------
 -- 6. 通用工具函数
@@ -224,6 +237,165 @@ returns boolean language sql stable security definer set search_path = public as
 $$;
 
 -- ------------------------------------------------------------
+-- 6.1 免费版操作配额（会员/超管不受限）
+--
+--   两种配额，免费用户各 10 次：
+--     remind  = 复制催办文本
+--     promote = 把名单外参会人一键加入名单
+--   计数只对"非会员"累加；买了套餐后再降级，计数保留但重新受限。
+-- ------------------------------------------------------------
+create or replace function public.free_quota_limit()
+returns integer language sql immutable as $$ select 10 $$;
+
+create or replace function public.quota_status()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := auth.uid();
+  v_unlimited boolean;
+  v_r integer := 0;
+  v_p integer := 0;
+begin
+  if v_uid is null then
+    return jsonb_build_object('ok', false, 'error', '请先登录');
+  end if;
+  v_unlimited := public.has_active_plan();
+  select quota_remind_used, quota_promote_used into v_r, v_p
+    from public.profiles where id = v_uid;
+
+  return jsonb_build_object(
+    'ok', true,
+    'unlimited', v_unlimited,
+    'limit', public.free_quota_limit(),
+    'remind',  jsonb_build_object('used', coalesce(v_r, 0),
+                 'left', greatest(0, public.free_quota_limit() - coalesce(v_r, 0))),
+    'promote', jsonb_build_object('used', coalesce(v_p, 0),
+                 'left', greatest(0, public.free_quota_limit() - coalesce(v_p, 0)))
+  );
+end $$;
+
+-- 消耗一次配额。p_kind = 'remind' | 'promote'
+create or replace function public.consume_quota(p_kind text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := auth.uid();
+  v_kind text := lower(btrim(coalesce(p_kind, '')));
+  v_used integer;
+  v_lim  integer := public.free_quota_limit();
+begin
+  if v_uid is null then
+    return jsonb_build_object('ok', false, 'error', '请先登录');
+  end if;
+
+  -- 会员 / 超管：不计数、不限制
+  if public.has_active_plan() then
+    return jsonb_build_object('ok', true, 'unlimited', true);
+  end if;
+
+  if v_kind = 'remind' then
+    update public.profiles
+       set quota_remind_used = quota_remind_used + 1
+     where id = v_uid and quota_remind_used < v_lim
+     returning quota_remind_used into v_used;
+  elsif v_kind = 'promote' then
+    update public.profiles
+       set quota_promote_used = quota_promote_used + 1
+     where id = v_uid and quota_promote_used < v_lim
+     returning quota_promote_used into v_used;
+  else
+    return jsonb_build_object('ok', false, 'error', '未知的配额类型');
+  end if;
+
+  if v_used is null then
+    return jsonb_build_object('ok', false, 'exhausted', true,
+      'error', case when v_kind = 'remind'
+                 then '免费版「复制催办文本」已用完 10 次，购买套餐后可不限次数使用'
+                 else '免费版「一键加入名单」已用完 10 次，购买套餐后可不限次数使用' end);
+  end if;
+
+  return jsonb_build_object('ok', true, 'unlimited', false,
+    'used', v_used, 'left', greatest(0, v_lim - v_used), 'limit', v_lim);
+end $$;
+
+-- 把某个"名单外"参会人一步加入自己的名单（原子操作：先校验、再扣配额、再写入）
+create or replace function public.promote_response_to_roster(p_response_id uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_uid   uuid := auth.uid();
+  v_resp  public.responses;
+  v_owner uuid;
+  v_already boolean;
+  v_sort  integer;
+  v_q     jsonb;
+  v_emp   text;
+  v_dept  text;
+  v_cat   text;
+  v_name  text;
+begin
+  if v_uid is null then
+    return jsonb_build_object('ok', false, 'error', '请先登录');
+  end if;
+
+  -- 只能操作自己会议的参会记录（超管除外）
+  select r.* into v_resp
+    from public.responses r
+    join public.meetings m on m.id = r.meeting_id
+   where r.id = p_response_id
+     and (m.owner_id = v_uid or public.is_super());
+  if not found then
+    return jsonb_build_object('ok', false, 'error', '找不到这条参会记录，或它不属于你的会议');
+  end if;
+
+  if coalesce(v_resp.on_list, false) then
+    return jsonb_build_object('ok', false, 'error', '这个人本来就在受邀名单里，不需要再加入');
+  end if;
+
+  v_name := btrim(coalesce(v_resp.name_raw, ''));
+  v_emp  := btrim(coalesce(v_resp.emp_no, ''));
+  v_dept := btrim(coalesce(v_resp.dept, ''));
+  v_cat  := btrim(coalesce(v_resp.category, ''));
+  if v_name = '' then
+    return jsonb_build_object('ok', false, 'error', '这条记录没有姓名，无法加入名单');
+  end if;
+
+  -- 已经在名单里（同工号，或同部门同姓名）→ 直接标记，不扣配额
+  select exists (
+    select 1 from public.roster
+     where owner_id = v_uid
+       and (
+         (v_emp <> '' and lower(btrim(coalesce(emp_no, ''))) = lower(v_emp))
+         or (v_emp = '' and name = v_name and coalesce(dept, '') = v_dept)
+       )
+  ) into v_already;
+
+  if v_already then
+    update public.responses set promoted = true where id = p_response_id;
+    return jsonb_build_object('ok', true, 'already', true, 'message', '这个人已经在你的名单里了');
+  end if;
+
+  -- 扣配额（会员不计数）
+  v_q := public.consume_quota('promote');
+  if not coalesce((v_q->>'ok')::boolean, false) then
+    return v_q;
+  end if;
+
+  select coalesce(max(sort_no), 0) + 1 into v_sort
+    from public.roster where owner_id = v_uid;
+
+  insert into public.roster as ro (owner_id, emp_no, dept, category, name, sort_no, active)
+  values (v_uid, v_emp, v_dept, v_cat, v_name, v_sort, true)
+  on conflict (owner_id, dept, category, name) do update
+    set emp_no = case when excluded.emp_no = '' then ro.emp_no else excluded.emp_no end,
+        active = true,
+        updated_at = now();
+
+  update public.responses set promoted = true where id = p_response_id;
+
+  return jsonb_build_object('ok', true, 'already', false,
+    'quota', v_q,
+    'added', jsonb_build_object('name', v_name, 'emp_no', v_emp, 'dept', v_dept, 'category', v_cat));
+end $$;
+
+-- ------------------------------------------------------------
 -- 7. 注册：auth.users 插入时自动建档案
 -- ------------------------------------------------------------
 create or replace function public.handle_new_user()
@@ -243,6 +415,8 @@ begin
     raise exception '工号 % 已经被注册，请直接登录或联系管理员', v_emp using errcode = '23505';
   end if;
 
+  -- 新用户不赠送任何套餐：注册后即处于"免费额度"
+  -- （需要给某个用户开通体验/赠送，由超级管理员在面板里操作）
   insert into public.profiles (id, emp_no, name, phone, email)
   values (new.id, v_emp, v_name, v_phone, coalesce(new.email, ''))
   on conflict (id) do nothing;
@@ -451,11 +625,21 @@ begin
 end $$;
 
 -- ------------------------------------------------------------
--- 10. 发布会议的套餐校验（数据库层强制，绕不过去）
+-- 10. 发布会议的额度校验（数据库层强制，前端绕不过去）
+--
+--   规则（2026 版）：
+--     · 账号被锁定            → 一律不能发布
+--     · 超级管理员            → 不受限制
+--     · 套餐有效            → 不限场次、不限邀请人数
+--     · 免费 / 套餐已过期      → 最多 1 场会议，单场最多 20 人
 -- ------------------------------------------------------------
 create or replace function public.check_meeting_allowed()
 returns trigger language plpgsql security definer set search_path = public as $$
-declare v_locked boolean; v_exp timestamptz;
+declare
+  v_locked boolean;
+  v_exp    timestamptz;
+  v_count  integer;
+  v_invite integer;
 begin
   select locked, plan_expires_at into v_locked, v_exp
     from public.profiles where id = new.owner_id;
@@ -463,9 +647,25 @@ begin
   if coalesce(v_locked, false) then
     raise exception '账号已被锁定，无法发布会议' using errcode = '42501';
   end if;
-  if not public.is_super() and (v_exp is null or v_exp <= now()) then
-    raise exception '套餐未开通或已过期，请先在「我的账户」购买套餐' using errcode = '42501';
+
+  -- 超级管理员与有效期内的会员：不受限制
+  if public.is_super() or (v_exp is not null and v_exp > now()) then
+    return new;
   end if;
+
+  -- 免费额度
+  select count(*) into v_count from public.meetings where owner_id = new.owner_id;
+  if v_count >= 1 then
+    raise exception '免费额度已用完：未开通套餐最多发布 1 场会议，请到「我的账户」购买套餐后继续'
+      using errcode = '42501';
+  end if;
+
+  v_invite := coalesce(jsonb_array_length(new.invite), 0);
+  if v_invite > 20 then
+    raise exception '免费额度限制：单场最多邀请 20 人（当前 % 人），购买套餐后不限人数', v_invite
+      using errcode = '42501';
+  end if;
+
   return new;
 end $$;
 
@@ -594,17 +794,23 @@ begin
   );
 end $$;
 
+-- v2.1：签名增加 p_emp_no（工号）。旧签名先删掉，避免 PostgREST 出现重载歧义。
+drop function if exists public.submit_response(text, text, boolean, text, text, text);
+drop function if exists public.my_response(text, text);
+
 create or replace function public.submit_response(
   p_token     text,
   p_name      text,
   p_attending boolean,
   p_reason    text default '',
   p_note      text default '',
-  p_ua        text default ''
+  p_ua        text default '',
+  p_emp_no    text default ''
 ) returns jsonb language plpgsql security definer set search_path = public as $$
 declare
   m public.meetings;
   v_key text;
+  v_emp text;
   v_hit jsonb;
   v_row public.responses;
   v_locked boolean := false;
@@ -630,22 +836,41 @@ begin
     return jsonb_build_object('ok', false, 'error', '请填写本人真实姓名（2-20 字）');
   end if;
 
-  v_key := lower(regexp_replace(p_name, '\s', '', 'g'));
+  v_emp := lower(btrim(coalesce(p_emp_no, '')));
+  if length(v_emp) < 1 or length(v_emp) > 30 then
+    return jsonb_build_object('ok', false, 'error', '请填写你的工号（用于区分同名人员）');
+  end if;
 
+  -- ① 优先按工号匹配受邀名单：同名不同人不会互相覆盖
   select x into v_hit
   from jsonb_array_elements(m.invite) x
-  where lower(regexp_replace(x->>'name', '\s', '', 'g')) = v_key
+  where lower(btrim(coalesce(x->>'emp_no', ''))) = v_emp
   limit 1;
 
+  -- ② 名单里没填工号的老数据，退一步按姓名匹配
+  if v_hit is null then
+    select x into v_hit
+    from jsonb_array_elements(m.invite) x
+    where lower(regexp_replace(coalesce(x->>'name', ''), '\s', '', 'g'))
+        = lower(regexp_replace(p_name, '\s', '', 'g'))
+    limit 1;
+  end if;
+
+  -- 去重键：有工号就以工号为准，否则用姓名
+  v_key := case when v_emp <> ''
+                then v_emp
+                else lower(regexp_replace(p_name, '\s', '', 'g')) end;
+
   insert into public.responses as r
-    (meeting_id, name_key, name_raw, dept, category, attending, reason, note, on_list, user_agent)
+    (meeting_id, name_key, name_raw, emp_no, dept, category, attending, reason, note, on_list, user_agent)
   values
-    (m.id, v_key, p_name,
+    (m.id, v_key, p_name, v_emp,
      coalesce(v_hit->>'dept', ''), coalesce(v_hit->>'category', ''),
      coalesce(p_attending, false), btrim(coalesce(p_reason, '')), btrim(coalesce(p_note, '')),
      (v_hit is not null), left(coalesce(p_ua, ''), 300))
   on conflict (meeting_id, name_key) do update set
     name_raw   = excluded.name_raw,
+    emp_no     = case when excluded.emp_no = '' then r.emp_no else excluded.emp_no end,
     dept       = case when excluded.dept = '' then r.dept else excluded.dept end,
     category   = case when excluded.category = '' then r.category else excluded.category end,
     attending  = excluded.attending,
@@ -660,30 +885,48 @@ begin
     'ok', true,
     'attending', v_row.attending,
     'name', v_row.name_raw,
+    'emp_no', v_row.emp_no,
     'on_list', v_row.on_list,
     'updated_at', v_row.updated_at,
     'message', case when v_row.attending then '已记录：您将按时参会' else '已记录：您不参会' end
   );
 end $$;
 
-create or replace function public.my_response(p_token text, p_name text)
+-- 回看/带出本人上次答复：给了工号就按工号找（同名也认得出是谁）
+create or replace function public.my_response(p_token text, p_name text, p_emp_no text default '')
 returns jsonb language plpgsql stable security definer set search_path = public as $$
-declare m public.meetings; v_row public.responses;
+declare
+  m public.meetings;
+  v_row public.responses;
+  v_emp text := lower(btrim(coalesce(p_emp_no, '')));
 begin
   select * into m from public.meetings where share_token = btrim(coalesce(p_token, ''));
   if not found then
     return jsonb_build_object('ok', false, 'error', '链接无效');
   end if;
-  select * into v_row from public.responses
-   where meeting_id = m.id
-     and name_key = lower(regexp_replace(btrim(coalesce(p_name, '')), '\s', '', 'g'));
-  if not found then
+
+  if v_emp <> '' then
+    select * into v_row from public.responses
+     where meeting_id = m.id
+       and (name_key = v_emp or emp_no = v_emp)
+     limit 1;
+  end if;
+
+  if v_row.id is null then
+    select * into v_row from public.responses
+     where meeting_id = m.id
+       and name_key = lower(regexp_replace(btrim(coalesce(p_name, '')), '\s', '', 'g'))
+     limit 1;
+  end if;
+
+  if v_row.id is null then
     return jsonb_build_object('ok', true, 'found', false);
   end if;
+
   return jsonb_build_object(
     'ok', true, 'found', true,
     'attending', v_row.attending, 'reason', v_row.reason,
-    'note', v_row.note, 'updated_at', v_row.updated_at
+    'note', v_row.note, 'updated_at', v_row.updated_at, 'emp_no', v_row.emp_no
   );
 end $$;
 
@@ -701,13 +944,19 @@ revoke all on function public.admin_review_recharge(uuid, boolean, text) from pu
 revoke all on function public.admin_adjust_balance(uuid, integer, text) from public;
 revoke all on function public.admin_grant_plan(uuid, uuid, integer) from public;
 revoke all on function public.open_meeting(text) from public;
-revoke all on function public.submit_response(text, text, boolean, text, text, text) from public;
-revoke all on function public.my_response(text, text) from public;
+revoke all on function public.submit_response(text, text, boolean, text, text, text, text) from public;
+revoke all on function public.my_response(text, text, text) from public;
+revoke all on function public.quota_status() from public;
+revoke all on function public.consume_quota(text) from public;
+revoke all on function public.promote_response_to_roster(uuid) from public;
 
 grant execute on function public.is_emp_no_taken(text)          to anon, authenticated;
 grant execute on function public.open_meeting(text)             to anon, authenticated;
-grant execute on function public.submit_response(text, text, boolean, text, text, text) to anon, authenticated;
-grant execute on function public.my_response(text, text)        to anon, authenticated;
+grant execute on function public.submit_response(text, text, boolean, text, text, text, text) to anon, authenticated;
+grant execute on function public.my_response(text, text, text)  to anon, authenticated;
+grant execute on function public.quota_status()                 to authenticated;
+grant execute on function public.consume_quota(text)            to authenticated;
+grant execute on function public.promote_response_to_roster(uuid) to authenticated;
 grant execute on function public.update_my_profile(text, text)  to authenticated;
 grant execute on function public.purchase_plan(uuid)            to authenticated;
 grant execute on function public.request_recharge(integer, text, text) to authenticated;
@@ -747,6 +996,15 @@ where not exists (select 1 from public.plans);
 --  where owner_id is null;
 -- update public.roster set owner_id = (select id from public.profiles where emp_no = '你的工号')
 --  where owner_id is null;
+
+-- ------------------------------------------------------------
+-- 16.1 可选：撤销早期版本自动赠送的「新用户 7 天体验」
+--      新版本已不再赠送体验。如果之前注册过的人还带着体验期，执行下面这句清掉：
+-- ------------------------------------------------------------
+-- update public.profiles
+--    set plan_expires_at = null
+--  where note = '新用户 7 天体验'
+--    and plan_expires_at is not null;
 
 -- ------------------------------------------------------------
 -- 17. 自检

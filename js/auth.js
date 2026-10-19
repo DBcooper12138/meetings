@@ -384,6 +384,70 @@
       '</div>';
     }).join('') || '<div class="empty">管理员还没有设置套餐</div>';
 
+    var ps = { active: p.is_super || (expires && expires.getTime() > Date.now()) };
+    var quotaNote = ps.active ? '' :
+      '<div class="notice warn" style="margin-top:12px"><b>你当前是免费额度：</b>' +
+      '最多发布 <b>1 场</b>会议、单场最多邀请 <b>20 人</b>，且<b>不能导出</b>。' +
+      '购买任意套餐即可解除限制。</div>';
+
+    /* ---- 会员 / 非会员 权益对比 ---- */
+    var isMember = ps.active;
+    var myMeetingCount = (MS().state.meetings || []).filter(function (x) {
+      return x.owner_id === p.id;
+    }).length;
+    var qi = MS().quotaInfo || function () { return null; };
+    var qr = qi('remind'), qp = qi('promote');
+    var usedRemind = qr ? qr.used : (p.quota_remind_used || 0);
+    var usedPromote = qp ? qp.used : (p.quota_promote_used || 0);
+
+    var BENEFITS = [
+      ['发布会议', '最多 <b>1 场</b>（已用 ' + myMeetingCount + ' 场）', '不限场次', true],
+      ['单场邀请人数', '最多 <b>20 人</b>', '不限人数', true],
+      ['复制催办文本', '<b>10 次</b>（已用 ' + usedRemind + ' 次）', '不限次数', true],
+      ['名单外人员一键加入名单', '<b>10 次</b>（已用 ' + usedPromote + ' 次）', '不限次数', true],
+      ['导出会议明细 / 统计 / 名单', '❌ 不可用', '✅ 可导出', true],
+      ['查看统计（按会议 / 按人员）', '✅ 可用', '✅ 可用', false],
+      ['维护名单（增删改 + Excel 导入）', '✅ 可用', '✅ 可用', false],
+      ['用历史会议作模板新建', '✅ 可用（受 1 场限制）', '✅ 可用', false],
+      ['参会链接与回执', '✅ 正常', '✅ 正常', false],
+      ['数据保留', '长期保留', '长期保留', false]
+    ];
+
+    var cmpRows = BENEFITS.map(function (b) {
+      var diff = b[3];
+      return '<tr' + (diff ? ' class="cmp-diff"' : '') + '>' +
+        '<td>' + b[0] + (diff ? ' <span class="tag amber">差异</span>' : '') + '</td>' +
+        '<td class="ctr' + (!isMember ? ' cmp-current' : '') + '">' + b[1] + '</td>' +
+        '<td class="ctr' + (isMember ? ' cmp-current' : '') + '">' + b[2] + '</td>' +
+      '</tr>';
+    }).join('');
+
+    var statusChip = p.is_super
+      ? '<span class="tag dark">超级管理员 · 不受额度限制</span>'
+      : (isMember
+        ? '<span class="tag green">会员 · 剩余 ' + daysLeft + ' 天</span>'
+        : '<span class="tag amber">免费额度</span>');
+
+    var cmpCard =
+      '<div class="card" style="margin-bottom:14px">' +
+        '<div class="card-h"><h2>会员权益对比</h2>' + statusChip +
+          '<span class="sp" style="flex:1"></span>' +
+          (isMember ? '' : '<button class="btn sm" id="ac-goto-plans">去购买套餐</button>') +
+        '</div>' +
+        '<div class="tbl-wrap"><table class="tbl cmp-table">' +
+          '<thead><tr>' +
+            '<th>功能</th>' +
+            '<th class="ctr' + (!isMember ? ' cmp-head-current' : '') + '">免费额度</th>' +
+            '<th class="ctr' + (isMember ? ' cmp-head-current' : '') + '">会员</th>' +
+          '</tr></thead><tbody>' + cmpRows + '</tbody>' +
+        '</table></div>' +
+        '<div class="card-b" style="border-top:1px solid var(--line)">' +
+          '<div class="hint">高亮的那一列是你**当前**的权益。' +
+          (isMember ? '' : '购买任意套餐后，上表「差异」项立即解锁，有效期从当前到期日顺延。') +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
     var rechargeList = (S.myRecharges || []).map(function (r) {
       var tag = r.status === 'approved' ? '<span class="tag green">已通过</span>'
               : r.status === 'rejected' ? '<span class="tag red">已驳回</span>'
@@ -430,12 +494,15 @@
           '</div>' +
           '<div class="btn-row"><button class="btn sm" id="ac-recharge">申请充值</button>' +
           '<button class="btn ghost sm" id="ac-refresh">刷新</button></div>' +
+          quotaNote +
           '<div class="hint" style="margin-top:10px">充值流程：提交申请 → 超级管理员核对到账后审批 → 余额到账。' +
           '目前未接在线支付。</div>' +
         '</div></div>' +
       '</div>' +
 
-      '<div class="card" style="margin-bottom:14px"><div class="card-h"><h2>套餐</h2>' +
+      cmpCard +
+
+      '<div class="card" id="ac-plans" style="margin-bottom:14px"><div class="card-h"><h2>套餐</h2>' +
         '<span class="hint">购买后有效期从当前到期日顺延</span></div>' +
         '<div class="card-b"><div class="plan-grid">' + planCards + '</div></div></div>' +
 
@@ -544,6 +611,12 @@
       MS().refreshProfile().then(function () { return MS().refreshAccount(); })
         .then(function () { MS().render(); toast('已刷新', 'ok'); })
         .catch(function (e) { toast(String(e.message || e), 'err'); });
+    });
+
+    var gotoPlans = q('ac-goto-plans');
+    if (gotoPlans) gotoPlans.addEventListener('click', function () {
+      var box = q('ac-plans');
+      if (box && box.scrollIntoView) box.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   }
 

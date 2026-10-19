@@ -33,6 +33,8 @@
     selectedRoster: {}, selectedInvite: {},
     detailTab: 'att',
     statsTab: 'meeting', statsFilter: 'all', statsMeetingId: '', statsPerson: '', statsPersonKw: '',
+    statsFrom: '', statsTo: '', statsKw: '', statsOwner: '', statsOwners: null,
+    templateId: '',
     adminTab: 'overview', adminRechargeFilter: 'pending',
     pendingEmail: '', resetEmail: '', flash: '',
     recoveryMode: false, recoveryInvalid: false, wantReset: false, passwordRecovery: false,
@@ -103,7 +105,7 @@
       if (!p) throw new Error('找不到你的账号档案。可能是注册时数据库触发器未生效，请确认已执行最新的 01_schema.sql');
       S.profile = p;
       S.ready = true;
-      return Promise.all([refreshAll(), refreshAccount()]);
+      return Promise.all([refreshAll(), refreshAccount(), loadQuota()]);
     }).then(function () {
       go('#/meetings');
       render();
@@ -197,7 +199,7 @@
       ['meetings', '📋', '会议看板', '#/meetings'],
       ['new', '➕', '发布会议', '#/new'],
       ['roster', '👥', '名单管理', '#/roster'],
-      ['stats', '📊', '统计', '#/stats'],
+      ['stats', '📊', '统计信息', '#/stats'],
       ['account', '💰', '我的账户', '#/account']
     ];
     if (p.is_super) nav.push(['admin', '🛡', '超级管理员', '#/admin']);
@@ -309,6 +311,69 @@
     });
   }
 
+  /* 权限口径（与数据库 check_meeting_allowed 保持一致） */
+  function planState() {
+    var p = S.profile || {};
+    var superUser = !!p.is_super;
+    var exp = p.plan_expires_at ? new Date(p.plan_expires_at) : null;
+    var active = superUser || (exp && exp.getTime() > Date.now());
+    var myMeetings = S.meetings.filter(function (m) { return m.owner_id === p.id; });
+    return {
+      isSuper: superUser,
+      active: !!active,
+      expires: exp,
+      daysLeft: active && exp ? Math.max(0, Math.ceil((exp.getTime() - Date.now()) / 86400000)) : 0,
+      meetingCount: myMeetings.length,
+      freeMeetingsLeft: active ? Infinity : Math.max(0, 1 - myMeetings.length),
+      canExport: !!active
+    };
+  }
+
+  /* 导出前的统一拦截 */
+  function requireExport() {
+    if (planState().canExport) return true;
+    U.confirmBox('导出属于会员功能。\n你当前的套餐未开通或已过期，购买套餐后即可导出。\n\n现在去「我的账户」看看套餐？')
+      .then(function (ok) { if (ok) go('#/account'); });
+    return false;
+  }
+
+  /* 免费版操作配额（催办复制 / 一键加入名单，各 10 次；会员不限） */
+  function quotaInfo(kind) {
+    var q = S.quota;
+    if (!q || !q.ok) return null;
+    if (q.unlimited) return { unlimited: true };
+    var k = (kind === 'remind' ? q.remind : q.promote) || { used: 0, left: 0 };
+    return { unlimited: false, used: k.used, left: k.left, limit: q.limit || 10 };
+  }
+
+  function quotaHintText(kind) {
+    var q = quotaInfo(kind);
+    if (!q) return '';
+    if (q.unlimited) return '会员：不限次数';
+    return '免费额度：已用 ' + q.used + '/' + q.limit + ' 次，剩 ' + q.left + ' 次';
+  }
+
+  function loadQuota() {
+    return DB.quotaStatus().then(function (q) { S.quota = q; return q; })
+      .catch(function () { S.quota = null; });
+  }
+
+  /* 扣一次配额；用完了引导购买 */
+  function useQuota(kind) {
+    return DB.consumeQuota(kind).then(function (r) {
+      if (!r || !r.ok) {
+        U.confirmBox((r && r.error) || '额度已用完').then(function (ok) {
+          if (ok) go('#/account');
+        });
+        return false;
+      }
+      return loadQuota().then(function () { return r; });
+    }).catch(function (e) {
+      toast(String(e.message || e), 'err');
+      return false;
+    });
+  }
+
   /* ============================================================
    *  会议看板
    * ============================================================ */
@@ -364,15 +429,21 @@
           (st.outside ? '<span class="tag amber">名单外 ' + st.outside + '</span>' : '') +
           '<span class="sp"></span>' +
           '<button class="btn ghost sm" data-copy="' + h(shareUrl(m.share_token)) + '">复制链接</button>' +
+          '<button class="btn ghost sm" data-template="' + h(m.id) + '">作模板新建</button>' +
         '</div></div>';
     }).join('');
 
-    var p = S.profile || {};
+    var ps = planState();
     var planWarn = '';
-    var planValid = p.is_super || (p.plan_expires_at && new Date(p.plan_expires_at).getTime() > Date.now());
-    if (!planValid) {
-      planWarn = '<div class="notice warn"><b>你的套餐还没开通或已过期</b>，暂时无法发布新会议。' +
-        '<a href="#/account">去「我的账户」充值并购买套餐 →</a></div>';
+    if (!ps.active) {
+      planWarn = '<div class="notice warn"><b>你当前是免费额度：</b>' +
+        '最多发布 <b>1 场</b>会议（已有 ' + ps.meetingCount + ' 场）、单场最多邀请 <b>20 人</b>，' +
+        '且<b>不支持导出</b>。' +
+        '<a href="#/account">购买套餐解除限制 →</a></div>';
+    } else if (!ps.isSuper && ps.expires) {
+      planWarn = '<div class="notice info">会员有效期至 <b>' +
+        U.fmtDate(ps.expires.toISOString().slice(0, 10)) + '</b>，剩余 ' + ps.daysLeft + ' 天。' +
+        '<a href="#/account">续费 →</a></div>';
     }
     if (S.mode === 'local') {
       planWarn = '<div class="notice warn"><b>当前是本机演示模式</b>：数据只存在这台电脑的浏览器里，' +
@@ -407,6 +478,21 @@
     });
     document.querySelectorAll('[data-filter]').forEach(function (b) {
       b.addEventListener('click', function () { S.filter = b.getAttribute('data-filter'); render(); });
+    });
+    document.querySelectorAll('[data-template]').forEach(function (b) {
+      b.addEventListener('click', function (e) {
+        e.stopPropagation(); e.preventDefault();
+        var id = b.getAttribute('data-template');
+        var src = S.meetings.filter(function (x) { return x.id === id; })[0];
+        if (!src) return;
+        confirmBox('用「' + (src.title || '这场会议') + '」作为模板新建一场会议？\n' +
+          '会复制：名称、时间、地点、主办部门、主持人、联系人、议程、以及参会人员名单。\n' +
+          '会议日期会改成今天，你可以再改。').then(function (ok) {
+          if (!ok) return;
+          S.templateId = id;
+          go('#/new');
+        });
+      });
     });
     bindCopyButtons();
   }
@@ -504,8 +590,8 @@
         '<div class="hint">受邀 ' + st.invited + ' 人。别人打开链接填写姓名并选择是否参会，' +
         '结果会自动回到本页（每 ' + Math.round((CFG.AUTO_REFRESH_MS || 30000) / 1000) + ' 秒自动刷新）。</div>' +
         (st.pending ? '<div class="btn-row" style="margin-top:12px">' +
-          '<button class="btn ghost sm" data-copy="' + h(remindText(m, att, url)) + '">复制催办文本（待确认 ' +
-          st.pending + ' 人）</button></div>' : '') +
+          '<button class="btn ghost sm" id="d-remind">复制催办文本（待确认 ' + st.pending + ' 人）</button>' +
+          '<span class="hint">' + quotaHintText('remind') + '</span></div>' : '') +
       '</div></div>' +
 
       '<div class="grid c3" style="margin-bottom:14px">' +
@@ -523,9 +609,15 @@
         }).join('') +
       '</div><div class="tbl-wrap"><table class="tbl"><thead><tr>' +
         '<th>#</th><th>工号</th><th>姓名</th><th>类别</th><th>部门</th><th>是否参会</th>' +
-        '<th>不参会原因</th><th>备注</th><th>回执时间</th>' +
+        '<th>不参会原因</th><th>备注</th><th>回执时间</th><th>操作</th>' +
       '</tr></thead><tbody>' +
         (visible.length ? visible.map(function (r, i) {
+          var act = '—';
+          if (!r.on_list) {
+            act = r.promoted
+              ? '<span class="tag green">已加入名单</span>'
+              : '<button class="btn sm" data-promote="' + h(r.response_id) + '">加入名单</button>';
+          }
           return '<tr>' +
             '<td class="ctr mini">' + (i + 1) + '</td>' +
             '<td class="mini">' + h(r.emp_no || '—') + '</td>' +
@@ -536,8 +628,9 @@
             '<td>' + (r.reason ? h(r.reason) : '<span class="mini">—</span>') + '</td>' +
             '<td>' + (r.note ? h(r.note) : '<span class="mini">—</span>') + '</td>' +
             '<td class="mini">' + (r.updated_at ? U.fmtDateTime(r.updated_at) : '—') + '</td>' +
+            '<td class="ctr">' + act + '</td>' +
           '</tr>';
-        }).join('') : '<tr><td colspan="9"><div class="empty">这个分类下暂时没有人</div></td></tr>') +
+        }).join('') : '<tr><td colspan="10"><div class="empty">这个分类下暂时没有人</div></td></tr>') +
       '</tbody></table></div></div>';
 
     return shell('meetings', '会议详情', '', body);
@@ -552,8 +645,7 @@
     return '<span class="tag amber">待确认</span>';
   }
 
-  function remindText(m, att, url) {
-    var pending = att.rows.filter(function (r) { return r.status === 'pending'; });
+  function remindText(m, att, url) {    var pending = att.rows.filter(function (r) { return r.status === 'pending'; });
     var lines = ['【参会确认提醒】' + (m.title || '')];
     if (m.meet_date) {
       lines.push('时间：' + U.fmtDateWeek(m.meet_date) +
@@ -599,6 +691,7 @@
     });
     var ex = q('d-export');
     if (ex) ex.addEventListener('click', function () {
+      if (!requireExport()) return;
       MSStats.exportMeeting(m, S.detailResponses || []);
     });
     var dl = q('d-del');
@@ -611,6 +704,50 @@
           S.meetings = S.meetings.filter(function (x) { return x.id !== m.id; });
           go('#/meetings');
         }).catch(function (e) { toast(String(e.message || e), 'err'); });
+      });
+    });
+
+    // 复制催办文本（消耗免费配额）
+    var rem = q('d-remind');
+    if (rem) rem.addEventListener('click', function () {
+      useQuota('remind').then(function (r) {
+        if (!r) return;
+        var att = P.buildAttendance(m, S.detailResponses || []);
+        var txt = remindText(m, att, shareUrl(m.share_token));
+        return copyText(txt).then(function () {
+          var q2 = quotaInfo('remind');
+          toast('催办文本已复制' + (q2 && !q2.unlimited ? '（免费额度剩余 ' + q2.left + ' 次）' : ''), 'ok');
+          render();
+        });
+      });
+    });
+
+    // 名单外参会人：一键加入名单
+    document.querySelectorAll('[data-promote]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var rid = b.getAttribute('data-promote');
+        b.disabled = true;
+        DB.promoteResponse(rid).then(function (r) {
+          if (!r || !r.ok) {
+            b.disabled = false;
+            U.confirmBox((r && r.error) || '加入失败').then(function (ok) {
+              if (ok) go('#/account');
+            });
+            return;
+          }
+          var q2 = quotaInfo('promote');
+          toast(r.already ? '这个人已经在名单里了'
+            : '已加入名单' + (q2 && !q2.unlimited ? '（免费额度剩余 ' + q2.left + ' 次）' : ''), 'ok');
+          return Promise.all([DB.listRoster(), DB.listResponses(id), loadQuota()])
+            .then(function (arr) {
+              S.roster = arr[0] || [];
+              setMeetingResponses(id, arr[1] || []);
+              render();
+            });
+        }).catch(function (e) {
+          b.disabled = false;
+          toast(String(e.message || e), 'err');
+        });
       });
     });
     bindCopyButtons();
@@ -677,11 +814,31 @@
     var m = isEdit ? S.meetings.filter(function (x) { return x.id === editId; })[0] : null;
     if (isEdit && !m) return shell('meetings', '编辑会议', '', '<div class="notice err">找不到该会议</div>');
 
-    var draft = m || {
+    // 用历史会议作模板
+    var tpl = null;
+    if (!isEdit && S.templateId) {
+      tpl = S.meetings.filter(function (x) { return x.id === S.templateId; })[0] || null;
+    }
+
+    var draft = m || (tpl ? {
+      title: tpl.title || '',
+      meet_date: U.todayISO(),                    // 日期换成今天，避免直接发到过去
+      start_time: tpl.start_time || '',
+      end_time: tpl.end_time || '',
+      location: tpl.location || '',
+      convene_dept: tpl.convene_dept || '',
+      host: tpl.host || '',
+      contact: tpl.contact || '',
+      agenda: tpl.agenda || '',
+      ask_reason: tpl.ask_reason !== false,
+      ask_note: tpl.ask_note !== false,
+      deadline: '',
+      invite: tpl.invite || []
+    } : {
       title: '', meet_date: U.todayISO(), start_time: '09:00', end_time: '11:00',
       location: '', convene_dept: '', host: '', contact: '', agenda: '',
       ask_reason: true, ask_note: true, deadline: '', invite: []
-    };
+    });
     S.editing = draft;
 
     S.selectedInvite = {};
@@ -698,6 +855,10 @@
       '<div class="btn-row" style="margin-bottom:14px">' +
         '<button class="btn ghost sm" data-go="#/meetings">← 返回看板</button>' +
       '</div>' +
+      (tpl ? '<div class="notice info">已从历史会议「' + h(tpl.title || '') + '」复制：' +
+        '名称、时间、地点、主办部门、主持人、联系人、议程和参会人员都已带过来。' +
+        '会议日期已改为今天，请确认后发布。<br>' +
+        '<span class="hint">如果原会议的参会人后来被从名单里删掉了，他们不会出现在这场会议里。</span></div>' : '') +
       '<div class="card" style="margin-bottom:14px"><div class="card-h"><h2>' +
         (isEdit ? '编辑会议' : '发布新会议') + '</h2></div><div class="card-b">' +
         '<label class="f"><span class="lb">会议名称 <span class="req">*</span></span>' +
@@ -740,6 +901,7 @@
         '<button class="btn ghost lg" data-go="#/meetings">取消</button>' +
       '</div>';
 
+    S.templateId = '';   // 模板只用一次，渲染完就清掉
     return shell('new', isEdit ? '编辑会议' : '发布会议', '', body);
   }
 
@@ -799,7 +961,16 @@
 
       var n = Object.keys(S.selectedInvite).filter(function (k) { return S.selectedInvite[k]; }).length;
       var c = q('f-count');
-      if (c) c.textContent = '已选 ' + n + ' 人';
+      if (c) {
+        var ps = planState();
+        if (!ps.active && n > 20) {
+          c.innerHTML = '已选 ' + n + ' 人 <span class="tag red">免费额度上限 20 人</span>';
+        } else if (!ps.active) {
+          c.innerHTML = '已选 ' + n + ' 人 <span class="tag amber">免费最多 20 人</span>';
+        } else {
+          c.textContent = '已选 ' + n + ' 人';
+        }
+      }
     }
 
     q('f-plist').addEventListener('change', function (e) {
@@ -932,7 +1103,28 @@
       '</tr>';
     }).join('');
 
+    var p = S.profile || {};
+    var storeNote = S.mode === 'cloud'
+      ? '<div class="notice ok" style="margin-bottom:14px">' +
+          '当前账号：<b>' + h(p.name || '') + '</b>（工号 ' + h(p.emp_no || '—') + '）　' +
+          '数据位置：<b>Supabase 云端</b>。' +
+          '换电脑、换浏览器、换手机登录同一个账号，看到的都是同一份名单；其他账号看不到你的名单。</div>'
+      : '<div class="notice warn" style="margin-bottom:14px">' +
+          '当前是<b>本机演示模式</b>，名单只存在这台电脑的浏览器里。' +
+          '接上 Supabase 后才会保存到云端。</div>';
+
+    var qr = quotaInfo('remind'), qp = quotaInfo('promote');
+    var quotaNote2 = '';
+    if (qr && !qr.unlimited) {
+      quotaNote2 = '<div class="notice info" style="margin-bottom:14px">' +
+        '<b>免费额度：</b>复制催办文本 <b>' + qr.used + '/' + qr.limit + '</b> 次，' +
+        '名单外人员一键加入名单 <b>' + (qp ? qp.used : 0) + '/' + (qp ? qp.limit : 10) + '</b> 次。' +
+        '<a href="#/account">购买套餐后不限次数 →</a></div>';
+    }
+
     var body =
+      storeNote +
+      quotaNote2 +
       '<div class="card" style="margin-bottom:14px"><div class="card-h">' +
         '<h2>人员名单（' + S.roster.length + ' 人）</h2>' +
         '<div class="sp" style="flex:1"></div>' +
@@ -1091,7 +1283,10 @@
     if (tpl) tpl.addEventListener('click', downloadRosterTemplate);
 
     var rex = q('r-export');
-    if (rex) rex.addEventListener('click', function () { MSStats.exportRoster(); });
+    if (rex) rex.addEventListener('click', function () {
+      if (!requireExport()) return;
+      MSStats.exportRoster();
+    });
   }
 
   function importRosterFile(file) {
@@ -1192,6 +1387,9 @@
           '本次参会确认已于 ' + h(U.fmtDateTime(m.deadline)) + ' 截止。' +
           '如需变更，请联系 ' + h(m.contact || '会议联系人') + '。</div></div></div>'
         : '<div class="share-card"><div class="hd">✍️ 请确认您的参会情况</div><div class="bd">' +
+            '<label class="f"><span class="lb">您的工号 <span class="req">*</span></span>' +
+            '<input class="input" id="s-emp" placeholder="如 1001" autocomplete="off" inputmode="text">' +
+            '<span class="hint">工号用于区分同名人员，请务必填写准确。</span></label>' +
             '<label class="f"><span class="lb">您的姓名 <span class="req">*</span></span>' +
             '<input class="input" id="s-name" list="s-namelist" placeholder="请填写本人真实姓名" autocomplete="off">' +
             '<datalist id="s-namelist">' + names.map(function (n) { return '<option value="' + h(n) + '">'; }).join('') + '</datalist>' +
@@ -1223,6 +1421,7 @@
 
     var picked = null;
     var nameInput = q('s-name');
+    var empInput = q('s-emp');
     var reasonWrap = q('s-reason-wrap');
     var msg = q('s-msg');
 
@@ -1241,25 +1440,35 @@
       });
     });
 
+    // 姓名或工号任一填好后，自动带出本人上次的答复
     var lastQuery = '';
-    nameInput.addEventListener('change', function () {
+    function loadMine() {
       var v = nameInput.value.trim();
-      if (v.length < 2 || v === lastQuery) return;
-      lastQuery = v;
-      DB.myResponse(st.token, v).then(function (r) {
+      var e = empInput ? empInput.value.trim() : '';
+      if (!e && v.length < 2) return;
+      var sig = e + '|' + v;
+      if (sig === lastQuery) return;
+      lastQuery = sig;
+      DB.myResponse(st.token, v, e).then(function (r) {
         if (!r || !r.ok || !r.found) return;
         picked = r.attending ? 'yes' : 'no';
         paintPick();
         if (r.reason && q('s-reason')) q('s-reason').value = r.reason;
         if (r.note && q('s-note')) q('s-note').value = r.note;
-        msg.innerHTML = '<div class="notice info" style="margin:0 0 12px">您上次填写的是「' +
-          (r.attending ? '参加' : '不参加') + '」（' + h(U.fmtDateTime(r.updated_at)) +
+        if (v.length < 2 && r.emp_no && nameInput) nameInput.value = '';  // 姓名没填就不猜
+        msg.innerHTML = '<div class="notice info" style="margin:0 0 12px">工号 ' +
+          h(r.emp_no || e) + ' 之前填过：' +
+          (r.attending ? '参加' : '不参加') + '（' + h(U.fmtDateTime(r.updated_at)) +
           '），可以直接修改后重新提交。</div>';
       }).catch(function () {});
-    });
+    }
+    nameInput.addEventListener('change', loadMine);
+    if (empInput) empInput.addEventListener('change', loadMine);
 
     q('s-submit').addEventListener('click', function () {
+      var emp = empInput ? empInput.value.trim() : '';
       var name = nameInput.value.trim();
+      if (!emp) { toast('请填写您的工号（用于区分同名人员）', 'warn'); if (empInput) empInput.focus(); return; }
       if (name.length < 2) { toast('请填写您的姓名（2-20 字）', 'warn'); nameInput.focus(); return; }
       if (!picked) { toast('请选择「参加」或「不参加」', 'warn'); return; }
       var reason = q('s-reason') ? q('s-reason').value.trim() : '';
@@ -1269,7 +1478,7 @@
       var note = q('s-note') ? q('s-note').value.trim() : '';
       var btn = q('s-submit');
       btn.disabled = true; btn.textContent = '正在提交…';
-      DB.submitResponse(st.token, name, picked === 'yes', reason, note).then(function (r) {
+      DB.submitResponse(st.token, name, picked === 'yes', reason, note, emp).then(function (r) {
         if (!r || !r.ok) {
           btn.disabled = false; btn.textContent = '提交确认';
           msg.innerHTML = '<div class="notice err" style="margin:0 0 12px">' + h(r && r.error || '提交失败') + '</div>';
@@ -1316,6 +1525,8 @@
     promptBox: promptBox, confirmBox: confirmBox,
     refreshAll: refreshAll, refreshProfile: refreshProfile, refreshAccount: refreshAccount,
     afterLogin: afterLogin,
+    planState: planState, requireExport: requireExport,
+    quotaInfo: quotaInfo, loadQuota: loadQuota,
     fmtDate: function (d) { return U.fmtDate(d); },
     fmtDateWeek: function (d) { return U.fmtDateWeek(d); },
     fmtDateTime: function (d) { return U.fmtDateTime(d); }
