@@ -1,7 +1,11 @@
 /* ============================================================
- *  db.js —— 数据访问层
- *   首选：Supabase 云端（真正的"任何地方都能填报/查看"）
- *   退路：本机 localStorage（云端没配置好时也能演示，但不同设备不互通）
+ *  db.js —— 数据访问层（v2 多用户版）
+ *
+ *  · 首选：Supabase 云端（Auth 登录 + RLS 按用户隔离）
+ *  · 退路：本机演示模式（localStorage，单用户，用于离线试用与自检）
+ *
+ *  所有敏感操作（改档案、买套餐、充值、超管操作）都走数据库函数，
+ *  不在前端做权限判断 —— 前端算出来的结果一律不可信。
  * ============================================================ */
 (function (root, factory) {
   var api = factory();
@@ -10,30 +14,21 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  var LS_KEY = 'ms_local_db_v1';
-  var ADMIN_KEY = 'ms_admin_secret';
+  var LS_KEY = 'ms_local_db_v2';
 
   function cfg() { return (typeof window !== 'undefined' && window.MS_CONFIG) || {}; }
 
-  /* 把用户手填的项目地址规范化：
-     容忍常见的粘贴错误 —— 重复的 https://、结尾的 /rest/v1/、多余斜杠和空格。
-     正确目标形态：https://xxxx.supabase.co
-     这样即便 config.js 里写得不对，也不会退化成 "Failed to fetch"。 */
+  /* ================= 地址规范化与配置体检 ================= */
   function normUrl(raw) {
     var u = String(raw == null ? '' : raw).trim();
     if (!u) return '';
-    // 反复去掉开头的 https:// / http:// （可能被粘了两三次）
     var guard = 0;
     while (/^https?:\/\//i.test(u) && guard++ < 5) u = u.replace(/^https?:\/\//i, '');
-    // 去掉结尾的 /rest/v1、/rest、/(任意路径) 与多余斜杠
     u = u.replace(/\/+$/, '').replace(/\/rest(\/v\d+)?$/i, '');
-    u = u.replace(/\/+$/, '');
-    // 去掉结尾的 / 之后可能残留的多余空格
-    u = u.trim();
+    u = u.replace(/\/+$/, '').trim();
     return u ? 'https://' + u : '';
   }
 
-  /* 返回配置体检结果，供界面显示明确原因 */
   function configCheck() {
     var c = cfg();
     var rawUrl = String(c.SUPABASE_URL || '');
@@ -54,72 +49,46 @@
     return !!(r.urlOk && r.keyOk);
   }
 
-  /* ================= 管理员口令（本机记忆） ================= */
-
-  function getSecret() {
-    try {
-      var s = localStorage.getItem(ADMIN_KEY);
-      if (s) return s;
-    } catch (e) { /* 隐私模式 */ }
-    return cfg().ADMIN_SECRET || '';
-  }
-
-  function setSecret(s) {
-    try { localStorage.setItem(ADMIN_KEY, s || ''); } catch (e) {}
-  }
-
-  function clearSecret() {
-    try { localStorage.removeItem(ADMIN_KEY); } catch (e) {}
-  }
-
   /* ================= Supabase 客户端 ================= */
-
   var _client = null;
-  var _clientSecret = null;
-
   function client() {
+    if (!isCloud()) throw new Error('尚未配置 Supabase（请编辑 config/config.js）');
+    if (_client) return _client;
     var r = configCheck();
-    if (!r.urlOk) {
-      throw new Error('config/config.js 里的 SUPABASE_URL 不对：' +
-        (r.urlRaw ? '“' + r.urlRaw + '”' : '（空的）') +
-        '。正确格式只填域名，例如 https://abcdefghijk.supabase.co，' +
-        '不要重复 https://，也不要带结尾的 /rest/v1/');
-    }
-    if (!r.keyOk) {
-      throw new Error('config/config.js 里的 SUPABASE_ANON_KEY 不对：' +
-        '应当是 Supabase 控制台 API Keys 里那串以 eyJ 开头的 anon public 密钥，且完整无换行');
-    }
-    var secret = getSecret();
-    // 口令变化时重建客户端，保证请求头里带的是最新口令
-    if (_client && _clientSecret === secret) return _client;
     if (typeof window.supabase === 'undefined' || !window.supabase.createClient) {
-      throw new Error('Supabase 客户端库没加载成功（cdn.jsdelivr.net 被拦截或断网），请检查网络后刷新页面');
+      throw new Error('Supabase 客户端库没加载成功（cdn.jsdelivr.net 被拦截或断网），请检查网络后刷新');
     }
     _client = window.supabase.createClient(r.url, r.key, {
-      auth: { persistSession: false, autoRefreshToken: false },
-      global: { headers: { 'x-admin-secret': secret } }
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+        // 用 implicit 而不是 pkce：邮件里的链接可以直接在任意浏览器/手机上打开。
+        // pkce 会把 code_verifier 存在"发起请求的那台浏览器"里，
+        // 用户在电脑上申请、用手机点开邮件就会失败 —— 学校场景里这太常见了。
+        flowType: 'implicit',
+        storageKey: 'ms_auth_token'
+      }
     });
-    _clientSecret = secret;
     return _client;
   }
 
-  /* ================= 本机降级存储 ================= */
-
+  /* ================= 本机演示存储 ================= */
   function readLocal() {
+    var empty = { meetings: [], responses: [], roster: [], profile: null, plans: [], wallet: [], recharges: [], users: [] };
     try {
       var raw = localStorage.getItem(LS_KEY);
-      return raw ? JSON.parse(raw) : { meetings: [], responses: [], roster: [] };
+      if (!raw) return empty;
+      var d = JSON.parse(raw);
+      return Object.assign(empty, d);
     } catch (e) {
-      return { meetings: [], responses: [], roster: [] };
+      return empty;
     }
   }
-
   function writeLocal(db) {
-    try { localStorage.setItem(LS_KEY, JSON.stringify(db)); } catch (e) {
-      throw new Error('本机存储写入失败（可能空间不足或处于隐私模式）');
-    }
+    try { localStorage.setItem(LS_KEY, JSON.stringify(db)); }
+    catch (e) { throw new Error('本机存储写入失败（可能空间不足或处于隐私模式）'); }
   }
-
   function uuid() {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (ch) {
@@ -127,64 +96,328 @@
       return (ch === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
     });
   }
-
   function randToken(len) {
     var chars = 'abcdefghijkmnpqrstuvwxyz23456789', out = '';
     for (var i = 0; i < (len || 12); i++) out += chars[Math.floor(Math.random() * chars.length)];
     return out;
   }
+  function nowISO() { return new Date().toISOString(); }
 
-  /* ================= 通用错误包装 ================= */
+  function localPlans() {
+    var db = readLocal();
+    if (!db.plans.length) {
+      db.plans = [
+        { id: 'plan-month', name: '月卡', price_cents: 9900, duration_days: 30, description: '有效期内发布会议不限场次', is_active: true, sort_no: 1 },
+        { id: 'plan-quarter', name: '季卡', price_cents: 26800, duration_days: 90, description: '比月卡更划算', is_active: true, sort_no: 2 },
+        { id: 'plan-year', name: '年卡', price_cents: 89900, duration_days: 365, description: '一年内不限场次', is_active: true, sort_no: 3 }
+      ];
+      writeLocal(db);
+    }
+    return db.plans;
+  }
+
+  /* ================= 错误翻译 ================= */
+  function humanError(msg) {
+    var m = String(msg || '');
+    if (/Invalid login credentials/i.test(m)) return '邮箱或密码不正确';
+    if (/Email not confirmed/i.test(m)) return '邮箱还没验证，请先到邮箱点击验证链接，或输入邮件里的验证码';
+    if (/User already registered/i.test(m)) return '这个邮箱已经注册过了，请直接登录';
+    if (/Password should be at least/i.test(m)) return '密码太短，至少 6 位';
+    if (/rate limit|too many requests|email rate limit/i.test(m)) return '邮件发送太频繁，请稍后再试（可在 Supabase 配置自定义 SMTP 提升额度）';
+    if (/套餐未开通|套餐已过期/.test(m)) return m;
+    if (/账号已被锁定/.test(m)) return m;
+    if (/Failed to fetch|NetworkError|Load failed|fetch failed/i.test(m)) {
+      return '无法连接服务器，请检查网络或稍后再试（原始错误：' + m + '）';
+    }
+    return m;
+  }
 
   function unwrap(res, what) {
-    if (res && res.error) {
-      var msg = res.error.message || String(res.error);
-      if (/permission denied|violates row-level security|JWT/i.test(msg)) {
-        throw new Error('后台口令不正确，或数据库安全策略未生效。请重新输入口令；' +
-                        '若始终不行，请确认已完整执行 supabase/01_schema.sql。');
-      }
-      throw new Error((what || '操作') + '失败：' + msg);
-    }
+    if (res && res.error) throw new Error(humanError(res.error.message || String(res.error)));
     return res ? res.data : null;
   }
 
-  /* ================= 管理员：连通性与口令校验 ================= */
+  /* ================= 认证 ================= */
+  function redirectTo(params) {
+    var base = location.origin + location.pathname;
+    var q = new URLSearchParams(params || {}).toString();
+    return base + (q ? '?' + q : '');
+  }
 
-  function ping() {
-    if (!isCloud()) return Promise.resolve({ mode: 'local' });
-    var r = configCheck();
-    return client().from('roster').select('id', { count: 'exact', head: true })
-      .then(function (res) {
-        if (res.error) {
-          var m = res.error.message || '';
-          if (/permission denied|row-level security/i.test(m)) {
-            var e = new Error('ADMIN_SECRET_WRONG');
-            e.code = 'ADMIN_SECRET_WRONG';
-            throw e;
-          }
-          if (/relation|does not exist|schema cache/i.test(m)) {
-            var e2 = new Error('SCHEMA_MISSING');
-            e2.code = 'SCHEMA_MISSING';
-            throw e2;
-          }
-          throw new Error(m);
+  var auth = {
+    /* 当前会话；本机演示模式返回假会话 */
+    getSession: function () {
+      if (!isCloud()) {
+        var db = readLocal();
+        if (!db.profile) return Promise.resolve(null);
+        return Promise.resolve({ user: { id: db.profile.id, email: db.profile.email } });
+      }
+      return client().auth.getSession().then(function (r) {
+        if (r.error) return null;
+        return r.data ? r.data.session : null;
+      });
+    },
+
+    signUp: function (info) {
+      if (!isCloud()) {
+        var db = readLocal();
+        if (db.users.some(function (u) { return u.email === info.email; })) {
+          return Promise.reject(new Error('这个邮箱已经注册过了，请直接登录'));
         }
-        return { mode: 'cloud', count: res.count };
-      })
-      .catch(function (err) {
-        var msg = String((err && err.message) || err);
-        // 浏览器网络层的失败（地址不可达、DNS、被拦截、被暂停）统一翻译成人话
-        if (/failed to fetch|networkerror|load failed|network request failed|fetch failed/i.test(msg)) {
-          throw new Error('无法连接 Supabase（' + r.url + '）。请依次检查：' +
-            '① 该地址在浏览器里能打开；② Supabase 项目没有被暂停；' +
-            '③ 这台电脑的网络没有拦截 *.supabase.co。原始错误：' + msg);
+        if (db.users.some(function (u) { return u.emp_no === info.empNo; })) {
+          return Promise.reject(new Error('工号 ' + info.empNo + ' 已经被注册'));
         }
-        throw err;
+        db.users.push({
+          id: uuid(), emp_no: info.empNo, name: info.name, phone: info.phone,
+          email: info.email, password: info.password, is_super: db.users.length === 0,
+          locked: false, locked_reason: '', balance_cents: 0, plan_id: null, plan_expires_at: null,
+          created_at: nowISO()
+        });
+        writeLocal(db);
+        return Promise.resolve({ needConfirm: false });
+      }
+      return client().auth.signUp({
+        email: info.email,
+        password: info.password,
+        options: {
+          data: { emp_no: info.empNo, name: info.name, phone: info.phone },
+          emailRedirectTo: redirectTo({ goto: 'login', confirm: '1' })
+        }
+      }).then(function (r) {
+        if (r.error) throw new Error(humanError(r.error.message));
+        return { needConfirm: !(r.data && r.data.session) };
+      });
+    },
+
+    signIn: function (email, password) {
+      if (!isCloud()) {
+        var db = readLocal();
+        var u = db.users.filter(function (x) { return x.email === email; })[0];
+        if (!u || u.password !== password) return Promise.reject(new Error('邮箱或密码不正确'));
+        if (u.locked) return Promise.reject(new Error('账号已被锁定，请联系管理员'));
+        db.profile = u;
+        writeLocal(db);
+        return Promise.resolve({ user: u });
+      }
+      return client().auth.signInWithPassword({ email: email, password: password })
+        .then(function (r) {
+          if (r.error) throw new Error(humanError(r.error.message));
+          return r.data;
+        });
+    },
+
+    signOut: function () {
+      if (!isCloud()) {
+        var db = readLocal();
+        db.profile = null;
+        writeLocal(db);
+        return Promise.resolve();
+      }
+      return client().auth.signOut();
+    },
+
+    getProfile: function () {
+      if (!isCloud()) return Promise.resolve(readLocal().profile);
+      return client().auth.getUser().then(function (r) {
+        if (r.error || !r.data || !r.data.user) return null;
+        return client().from('profiles').select('*').eq('id', r.data.user.id).maybeSingle()
+          .then(function (res) {
+            if (res.error) throw new Error(humanError(res.error.message));
+            return res.data;
+          });
+      });
+    },
+
+    isEmpNoTaken: function (empNo) {
+      if (!isCloud()) {
+        var db = readLocal();
+        return Promise.resolve(db.users.some(function (u) { return u.emp_no === empNo; }));
+      }
+      return client().rpc('is_emp_no_taken', { p_emp_no: empNo })
+        .then(function (r) { return r.error ? false : !!r.data; });
+    },
+
+    /* 发送重置密码邮件（邮件里是 6 位验证码，也可能带链接） */
+    sendResetCode: function (email) {
+      if (!isCloud()) {
+        var db = readLocal();
+        var u = db.users.filter(function (x) { return x.email === email; })[0];
+        if (!u) return Promise.reject(new Error('该邮箱还没有注册'));
+        u._reset = String(Math.floor(100000 + Math.random() * 900000));
+        writeLocal(db);
+        if (typeof console !== 'undefined') console.log('[本机演示] 重置验证码：', u._reset);
+        return Promise.resolve({ demoCode: u._reset });
+      }
+      return client().auth.resetPasswordForEmail(email, {
+        redirectTo: redirectTo({ goto: 'reset' })
+      }).then(function (r) {
+        if (r.error) throw new Error(humanError(r.error.message));
+        return { ok: true };
+      });
+    },
+
+    /* 用邮件里的 6 位码换取可改密码的会话 */
+    verifyRecoveryCode: function (email, token) {
+      if (!isCloud()) {
+        var db = readLocal();
+        var u = db.users.filter(function (x) { return x.email === email; })[0];
+        if (!u) return Promise.reject(new Error('该邮箱还没有注册'));
+        if (!u._reset || u._reset !== String(token).trim()) {
+          return Promise.reject(new Error('验证码不正确或已过期'));
+        }
+        return Promise.resolve({ email: email });
+      }
+      return client().auth.verifyOtp({ email: email, token: String(token).trim(), type: 'recovery' })
+        .then(function (r) {
+          if (r.error) throw new Error(humanError(r.error.message));
+          return r.data;
+        });
+    },
+
+    /* 注册确认用验证码（需在 Supabase 邮件模板里放 {{ .Token }}） */
+    verifySignupCode: function (email, token) {
+      if (!isCloud()) return Promise.reject(new Error('本机演示模式不需要邮箱验证'));
+      return client().auth.verifyOtp({ email: email, token: String(token).trim(), type: 'signup' })
+        .then(function (r) {
+          if (r.error) throw new Error(humanError(r.error.message));
+          return r.data;
+        });
+    },
+
+    resendConfirm: function (email) {
+      if (!isCloud()) return Promise.resolve(true);
+      return client().auth.resend({ type: 'signup', email: email })
+        .then(function (r) {
+          if (r.error) throw new Error(humanError(r.error.message));
+          return true;
+        });
+    },
+
+    updatePassword: function (password) {
+      if (!isCloud()) {
+        var db = readLocal();
+        var me = db.profile && db.profile.email;
+        db.users.forEach(function (u) { if (u.email === me) u.password = password; });
+        writeLocal(db);
+        return Promise.resolve(true);
+      }
+      return client().auth.updateUser({ password: password })
+        .then(function (r) {
+          if (r.error) throw new Error(humanError(r.error.message));
+          return true;
+        });
+    },
+
+    onAuthChange: function (cb) {
+      if (!isCloud()) return;
+      client().auth.onAuthStateChange(function (event, session) {
+        try { cb(event, session); } catch (e) { /* 忽略 */ }
+      });
+    }
+  };
+
+  /* ================= 档案与钱包 ================= */
+  function updateMyProfile(name, phone) {
+    if (!isCloud()) {
+      var db = readLocal();
+      if (db.profile) {
+        db.profile.name = name; db.profile.phone = phone;
+        db.users = db.users.map(function (u) { return u.id === db.profile.id ? db.profile : u; });
+      }
+      writeLocal(db);
+      return Promise.resolve({ ok: true });
+    }
+    return client().rpc('update_my_profile', { p_name: name, p_phone: phone })
+      .then(function (r) { return unwrap(r, '保存资料'); });
+  }
+
+  function listPlans() {
+    if (!isCloud()) {
+      return Promise.resolve(localPlans().filter(function (p) { return p.is_active; })
+        .sort(function (a, b) { return a.sort_no - b.sort_no; }));
+    }
+    return client().from('plans').select('*').eq('is_active', true)
+      .order('sort_no', { ascending: true })
+      .then(function (r) { return unwrap(r, '读取套餐') || []; });
+  }
+
+  function listWalletLogs(userId) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var me = userId || (db.profile && db.profile.id);
+      return Promise.resolve(db.wallet.filter(function (w) { return w.user_id === me; })
+        .sort(function (a, b) { return a.created_at < b.created_at ? 1 : -1; }));
+    }
+    var q = client().from('wallet_logs').select('*').order('created_at', { ascending: false }).limit(200);
+    if (userId) q = q.eq('user_id', userId);
+    return q.then(function (r) { return unwrap(r, '读取账单') || []; });
+  }
+
+  function purchasePlan(planId) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var p = localPlans().filter(function (x) { return x.id === planId; })[0];
+      if (!p) return Promise.reject(new Error('套餐不存在'));
+      var me = db.profile;
+      if (!me) return Promise.reject(new Error('请先登录'));
+      if (me.balance_cents < p.price_cents) {
+        return Promise.reject(new Error('余额不足：需要 ' + (p.price_cents / 100).toFixed(2) +
+          ' 元，当前余额 ' + (me.balance_cents / 100).toFixed(2) + ' 元，请先充值'));
+      }
+      var base = Math.max(Date.now(), me.plan_expires_at ? new Date(me.plan_expires_at).getTime() : 0);
+      me.balance_cents -= p.price_cents;
+      me.plan_id = p.id;
+      me.plan_expires_at = new Date(base + p.duration_days * 86400000).toISOString();
+      db.users = db.users.map(function (u) { return u.id === me.id ? Object.assign({}, u, me) : u; });
+      db.wallet.push({
+        id: uuid(), user_id: me.id, delta_cents: -p.price_cents,
+        balance_after: me.balance_cents, kind: 'plan',
+        note: '购买套餐：' + p.name, created_at: nowISO()
+      });
+      writeLocal(db);
+      return Promise.resolve({ ok: true, balance_cents: me.balance_cents, plan_expires_at: me.plan_expires_at, plan_name: p.name });
+    }
+    return client().rpc('purchase_plan', { p_plan_id: planId })
+      .then(function (r) {
+        var d = unwrap(r, '购买套餐');
+        if (d && d.ok === false) throw new Error(d.error || '购买失败');
+        return d;
       });
   }
 
-  /* ================= 名单 ================= */
+  function requestRecharge(amountCents, method, note) {
+    if (!isCloud()) {
+      var db = readLocal();
+      db.recharges.push({
+        id: uuid(), user_id: db.profile.id, amount_cents: amountCents,
+        method: method || '', note: note || '', status: 'pending',
+        review_note: '', reviewed_at: null, created_at: nowISO()
+      });
+      writeLocal(db);
+      return Promise.resolve({ ok: true });
+    }
+    return client().rpc('request_recharge', {
+      p_amount_cents: amountCents, p_method: method || '', p_note: note || ''
+    }).then(function (r) {
+      var d = unwrap(r, '提交充值申请');
+      if (d && d.ok === false) throw new Error(d.error || '提交失败');
+      return d;
+    });
+  }
 
+  function listMyRecharges() {
+    if (!isCloud()) {
+      var db = readLocal();
+      var me = db.profile && db.profile.id;
+      return Promise.resolve(db.recharges.filter(function (x) { return x.user_id === me; })
+        .sort(function (a, b) { return a.created_at < b.created_at ? 1 : -1; }));
+    }
+    return client().from('recharge_requests').select('*')
+      .order('created_at', { ascending: false }).limit(100)
+      .then(function (r) { return unwrap(r, '读取充值记录') || []; });
+  }
+
+  /* ================= 名单 ================= */
   function listRoster() {
     if (!isCloud()) {
       var db = readLocal();
@@ -202,12 +435,13 @@
     if (!rows || !rows.length) return Promise.resolve([]);
     if (!isCloud()) {
       var db = readLocal();
+      var me = db.profile ? db.profile.id : null;
       rows.forEach(function (x) {
         var hit = db.roster.filter(function (y) {
           return y.dept === x.dept && y.name === x.name && (y.category || '') === (x.category || '');
         })[0];
-        if (hit) { Object.assign(hit, x, { updated_at: new Date().toISOString() }); }
-        else { db.roster.push(Object.assign({ id: uuid(), active: true }, x)); }
+        if (hit) Object.assign(hit, x, { updated_at: nowISO() });
+        else db.roster.push(Object.assign({ id: uuid(), owner_id: me, active: true }, x));
       });
       writeLocal(db);
       return Promise.resolve(rows);
@@ -215,12 +449,12 @@
     return client().from('roster')
       .upsert(rows.map(function (x) {
         return {
-          dept: x.dept || '', category: x.category || '', name: x.name,
+          emp_no: x.emp_no || '', dept: x.dept || '', category: x.category || '', name: x.name,
           phone: x.phone || '', note: x.note || '',
           sort_no: x.sort_no == null ? 0 : x.sort_no,
           active: x.active === false ? false : true
         };
-      }), { onConflict: 'dept,category,name' })
+      }), { onConflict: 'owner_id,dept,category,name' })
       .select()
       .then(function (r) { return unwrap(r, '写入名单'); });
   }
@@ -248,32 +482,20 @@
       .then(function (r) { return unwrap(r, '删除名单'); });
   }
 
-  function clearRoster() {
-    if (!isCloud()) {
-      var db = readLocal(); db.roster = []; writeLocal(db);
-      return Promise.resolve(true);
-    }
-    // 用 neq 一个不存在的 id 实现"全删"，避免依赖 filter 语法
-    return client().from('roster').delete().neq('id', '00000000-0000-0000-0000-000000000000')
-      .then(function (r) { return unwrap(r, '清空名单'); });
-  }
-
   /* ================= 会议 ================= */
-
   function listMeetings() {
     if (!isCloud()) {
       var db = readLocal();
-      return Promise.resolve(db.meetings.slice().sort(byMeetingOrder));
+      return Promise.resolve(db.meetings.slice().sort(function (a, b) {
+        var da = a.meet_date || '', db2 = b.meet_date || '';
+        if (da !== db2) return da < db2 ? 1 : -1;
+        return String(b.created_at || '') < String(a.created_at || '') ? -1 : 1;
+      }));
     }
-    return client().from('meetings').select('*').order('meet_date', { ascending: false, nullsFirst: false })
+    return client().from('meetings').select('*')
+      .order('meet_date', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
       .then(function (r) { return unwrap(r, '读取会议') || []; });
-  }
-
-  function byMeetingOrder(a, b) {
-    var da = a.meet_date || '', db2 = b.meet_date || '';
-    if (da !== db2) return da < db2 ? 1 : -1;
-    return String(b.created_at || '') < String(a.created_at || '') ? -1 : 1;
   }
 
   function getMeeting(id) {
@@ -285,12 +507,31 @@
       .then(function (r) { return unwrap(r, '读取会议'); });
   }
 
+  function normalizeMeeting(m, isPatch) {
+    var keys = ['title', 'meet_date', 'start_time', 'end_time', 'location', 'convene_dept',
+                'host', 'contact', 'agenda', 'ask_reason', 'ask_note', 'deadline', 'invite', 'status'];
+    var out = {};
+    keys.forEach(function (k) {
+      if (m[k] !== undefined) out[k] = (m[k] === '' && (k === 'meet_date' || k === 'deadline')) ? null : m[k];
+    });
+    if (!isPatch) {
+      if (out.title === undefined) out.title = '未命名会议';
+      if (out.invite === undefined) out.invite = [];
+    }
+    return out;
+  }
+
   function createMeeting(m) {
     if (!isCloud()) {
       var db = readLocal();
+      var me = db.profile;
+      if (!me) throw new Error('请先登录');
+      if (!me.is_super && (!me.plan_expires_at || new Date(me.plan_expires_at).getTime() <= Date.now())) {
+        throw new Error('套餐未开通或已过期，请先在「我的账户」购买套餐');
+      }
       var row = Object.assign({
-        id: uuid(), share_token: randToken(12),
-        status: 'published', created_at: new Date().toISOString()
+        id: uuid(), owner_id: me.id, share_token: randToken(12),
+        status: 'published', created_at: nowISO()
       }, m);
       db.meetings.push(row);
       writeLocal(db);
@@ -323,23 +564,7 @@
       .then(function (r) { return unwrap(r, '删除会议'); });
   }
 
-  function normalizeMeeting(m, isPatch) {
-    var keys = ['title', 'meet_date', 'start_time', 'end_time', 'location', 'convene_dept',
-                'host', 'contact', 'agenda', 'ask_reason', 'ask_note', 'deadline',
-                'invite', 'status'];
-    var out = {};
-    keys.forEach(function (k) {
-      if (m[k] !== undefined) out[k] = (m[k] === '' && (k === 'meet_date' || k === 'deadline')) ? null : m[k];
-    });
-    if (!isPatch) {
-      if (out.title === undefined) out.title = '未命名会议';
-      if (out.invite === undefined) out.invite = [];
-    }
-    return out;
-  }
-
   /* ================= 回执 ================= */
-
   function listResponses(meetingId) {
     if (!isCloud()) {
       var db = readLocal();
@@ -368,8 +593,7 @@
       .then(function (r) { return unwrap(r, '删除回执'); });
   }
 
-  /* ================= 二级网页（参会人） ================= */
-
+  /* ================= 参会人填报（匿名） ================= */
   function openMeeting(token) {
     if (!isCloud()) {
       var db = readLocal();
@@ -382,7 +606,8 @@
           title: m.title, meet_date: m.meet_date, start_time: m.start_time, end_time: m.end_time,
           location: m.location, convene_dept: m.convene_dept, host: m.host, contact: m.contact,
           agenda: m.agenda, ask_reason: m.ask_reason !== false, ask_note: m.ask_note !== false,
-          deadline: m.deadline, closed: closed, invite_count: (m.invite || []).length
+          deadline: m.deadline, closed: closed, invite_count: (m.invite || []).length,
+          organizer: (db.profile && db.profile.name) || ''
         },
         names: (m.invite || []).map(function (x) { return x.name; })
       });
@@ -408,8 +633,8 @@
         id: cur ? cur.id : uuid(), meeting_id: m.id, name_key: key, name_raw: name,
         dept: hit ? hit.dept : '', category: hit ? hit.category : '',
         attending: !!attending, reason: reason || '', note: note || '',
-        on_list: !!hit, updated_at: new Date().toISOString(),
-        created_at: cur ? cur.created_at : new Date().toISOString()
+        on_list: !!hit, updated_at: nowISO(),
+        created_at: cur ? cur.created_at : nowISO()
       };
       db.responses = db.responses.filter(function (r) { return r.id !== row.id; });
       db.responses.push(row);
@@ -420,7 +645,6 @@
         message: row.attending ? '已记录：您将按时参会' : '已记录：您不参会'
       });
     }
-    var c = cfg();
     return client().rpc('submit_response', {
       p_token: token, p_name: name, p_attending: !!attending,
       p_reason: reason || '', p_note: note || '',
@@ -445,15 +669,225 @@
       .then(function (r) { return unwrap(r, '读取回执'); });
   }
 
+  /* ================= 超级管理员 ================= */
+  var admin = {
+    listUsers: function () {
+      if (!isCloud()) {
+        var db = readLocal();
+        return Promise.resolve(db.users.map(function (u) {
+          var c = Object.assign({}, u);
+          delete c.password; delete c._reset;
+          return c;
+        }));
+      }
+      return client().from('profiles').select('*').order('created_at', { ascending: true })
+        .then(function (r) { return unwrap(r, '读取用户') || []; });
+    },
+
+    updateUser: function (id, patch) {
+      if (!isCloud()) {
+        var db = readLocal();
+        db.users.forEach(function (u) { if (u.id === id) Object.assign(u, patch); });
+        writeLocal(db);
+        return Promise.resolve(true);
+      }
+      return client().from('profiles').update(patch).eq('id', id)
+        .then(function (r) { return unwrap(r, '修改用户'); });
+    },
+
+    adjustBalance: function (id, deltaCents, note) {
+      if (!isCloud()) {
+        var db = readLocal();
+        var u = db.users.filter(function (x) { return x.id === id; })[0];
+        if (!u) return Promise.reject(new Error('用户不存在'));
+        u.balance_cents = Math.max(0, u.balance_cents + deltaCents);
+        db.wallet.push({
+          id: uuid(), user_id: id, delta_cents: deltaCents, balance_after: u.balance_cents,
+          kind: 'adjust', note: '管理员调整' + (note ? '：' + note : ''), created_at: nowISO()
+        });
+        writeLocal(db);
+        return Promise.resolve({ ok: true, balance_cents: u.balance_cents });
+      }
+      return client().rpc('admin_adjust_balance', {
+        p_user_id: id, p_delta_cents: deltaCents, p_note: note || ''
+      }).then(function (r) { return unwrap(r, '调整余额'); });
+    },
+
+    grantPlan: function (id, planId, days) {
+      if (!isCloud()) {
+        var db = readLocal();
+        var u = db.users.filter(function (x) { return x.id === id; })[0];
+        var p = localPlans().filter(function (x) { return x.id === planId; })[0];
+        var n = days || (p ? p.duration_days : 0);
+        if (!u || !n) return Promise.reject(new Error('参数不正确'));
+        var base = Math.max(Date.now(), u.plan_expires_at ? new Date(u.plan_expires_at).getTime() : 0);
+        u.plan_expires_at = new Date(base + n * 86400000).toISOString();
+        if (p) u.plan_id = p.id;
+        writeLocal(db);
+        return Promise.resolve({ ok: true, plan_expires_at: u.plan_expires_at });
+      }
+      return client().rpc('admin_grant_plan', {
+        p_user_id: id, p_plan_id: planId || null, p_days: days || 0
+      }).then(function (r) { return unwrap(r, '开通套餐'); });
+    },
+
+    listAllPlans: function () {
+      if (!isCloud()) return Promise.resolve(localPlans());
+      return client().from('plans').select('*').order('sort_no', { ascending: true })
+        .then(function (r) { return unwrap(r, '读取套餐') || []; });
+    },
+
+    savePlan: function (plan) {
+      if (!isCloud()) {
+        var db = readLocal();
+        if (plan.id) {
+          db.plans = db.plans.map(function (p) { return p.id === plan.id ? Object.assign({}, p, plan) : p; });
+        } else {
+          plan.id = uuid();
+          db.plans.push(plan);
+        }
+        writeLocal(db);
+        return Promise.resolve(plan);
+      }
+      var payload = {
+        name: plan.name, price_cents: plan.price_cents, duration_days: plan.duration_days,
+        description: plan.description || '', is_active: plan.is_active !== false,
+        sort_no: plan.sort_no || 0
+      };
+      if (plan.id) {
+        return client().from('plans').update(payload).eq('id', plan.id).select().single()
+          .then(function (r) { return unwrap(r, '保存套餐'); });
+      }
+      return client().from('plans').insert(payload).select().single()
+        .then(function (r) { return unwrap(r, '新增套餐'); });
+    },
+
+    deletePlan: function (id) {
+      if (!isCloud()) {
+        var db = readLocal();
+        db.plans = db.plans.filter(function (p) { return p.id !== id; });
+        writeLocal(db);
+        return Promise.resolve(true);
+      }
+      return client().from('plans').delete().eq('id', id)
+        .then(function (r) { return unwrap(r, '删除套餐'); });
+    },
+
+    /* 充值申请：两次查询后在本地拼用户信息，避免依赖 PostgREST 的嵌套写法 */
+    listRecharges: function (status) {
+      if (!isCloud()) {
+        var db = readLocal();
+        return Promise.resolve(db.recharges
+          .filter(function (x) { return !status || x.status === status; })
+          .map(function (x) {
+            var u = db.users.filter(function (y) { return y.id === x.user_id; })[0];
+            return Object.assign({}, x, { user_name: u ? u.name : '', user_emp_no: u ? u.emp_no : '' });
+          })
+          .sort(function (a, b) { return a.created_at < b.created_at ? 1 : -1; }));
+      }
+      var q = client().from('recharge_requests').select('*')
+        .order('created_at', { ascending: false }).limit(300);
+      if (status) q = q.eq('status', status);
+      return Promise.all([q, client().from('profiles').select('id,name,emp_no')]).then(function (arr) {
+        var list = unwrap(arr[0], '读取充值申请') || [];
+        var users = unwrap(arr[1], '读取用户') || [];
+        var map = {};
+        users.forEach(function (u) { map[u.id] = u; });
+        return list.map(function (x) {
+          var u = map[x.user_id] || {};
+          return Object.assign({}, x, { user_name: u.name || '', user_emp_no: u.emp_no || '' });
+        });
+      });
+    },
+
+    reviewRecharge: function (id, approve, note) {
+      if (!isCloud()) {
+        var db = readLocal();
+        var req = db.recharges.filter(function (x) { return x.id === id; })[0];
+        if (!req) return Promise.reject(new Error('申请不存在'));
+        if (req.status !== 'pending') return Promise.reject(new Error('该申请已经处理过了'));
+        req.status = approve ? 'approved' : 'rejected';
+        req.review_note = note || '';
+        req.reviewed_at = nowISO();
+        if (approve) {
+          var u = db.users.filter(function (x) { return x.id === req.user_id; })[0];
+          if (u) {
+            u.balance_cents += req.amount_cents;
+            db.wallet.push({
+              id: uuid(), user_id: u.id, delta_cents: req.amount_cents,
+              balance_after: u.balance_cents, kind: 'recharge',
+              note: '充值审批通过', created_at: nowISO()
+            });
+          }
+        }
+        writeLocal(db);
+        return Promise.resolve({ ok: true });
+      }
+      return client().rpc('admin_review_recharge', {
+        p_request_id: id, p_approve: !!approve, p_note: note || ''
+      }).then(function (r) { return unwrap(r, '审批充值'); });
+    },
+
+    /* 所有用户的会议：两次查询后本地拼归属人 */
+    listAllMeetings: function () {
+      if (!isCloud()) {
+        var db = readLocal();
+        return Promise.resolve(db.meetings.map(function (m) {
+          var u = db.users.filter(function (y) { return y.id === m.owner_id; })[0];
+          return Object.assign({}, m, {
+            owner_name: u ? u.name : '', owner_emp_no: u ? u.emp_no : ''
+          });
+        }));
+      }
+      return Promise.all([
+        client().from('meetings').select('*').order('created_at', { ascending: false }).limit(500),
+        client().from('profiles').select('id,name,emp_no,email,locked')
+      ]).then(function (arr) {
+        var list = unwrap(arr[0], '读取会议') || [];
+        var users = unwrap(arr[1], '读取用户') || [];
+        var map = {};
+        users.forEach(function (u) { map[u.id] = u; });
+        return list.map(function (m) {
+          var u = map[m.owner_id] || {};
+          return Object.assign({}, m, {
+            owner_name: u.name || '', owner_emp_no: u.emp_no || '',
+            owner_email: u.email || '', owner_locked: !!u.locked
+          });
+        });
+      });
+    }
+  };
+
+  /* 本机演示模式：自动用一个本机账号登录 */
+  function enterDemo() {
+    if (isCloud()) return Promise.resolve(null);
+    var db = readLocal();
+    if (!db.user) {
+      if (!db.users.length) {
+        db.users.push({
+          id: uuid(), emp_no: 'demo', name: '演示用户', phone: '', email: 'demo@local',
+          password: 'demo', is_super: true, locked: false, locked_reason: '',
+          balance_cents: 0, plan_id: null, plan_expires_at: null, created_at: nowISO()
+        });
+      }
+      db.user = db.users[0];
+    }
+    db.profile = db.user;
+    writeLocal(db);
+    return Promise.resolve(db.profile);
+  }
+
   return {
-    isCloud: isCloud, ping: ping, configCheck: configCheck, normalizeUrl: normUrl,
-    getSecret: getSecret, setSecret: setSecret, clearSecret: clearSecret,
-    listRoster: listRoster, insertRoster: insertRoster, updateRoster: updateRoster,
-    deleteRoster: deleteRoster, clearRoster: clearRoster,
+    isCloud: isCloud, configCheck: configCheck, normalizeUrl: normUrl,
+    auth: auth,
+    updateMyProfile: updateMyProfile,
+    listPlans: listPlans, listWalletLogs: listWalletLogs,
+    purchasePlan: purchasePlan, requestRecharge: requestRecharge, listMyRecharges: listMyRecharges,
+    listRoster: listRoster, insertRoster: insertRoster, updateRoster: updateRoster, deleteRoster: deleteRoster,
     listMeetings: listMeetings, getMeeting: getMeeting, createMeeting: createMeeting,
     updateMeeting: updateMeeting, deleteMeeting: deleteMeeting,
-    listResponses: listResponses, listAllResponses: listAllResponses,
-    deleteResponse: deleteResponse,
-    openMeeting: openMeeting, submitResponse: submitResponse, myResponse: myResponse
+    listResponses: listResponses, listAllResponses: listAllResponses, deleteResponse: deleteResponse,
+    openMeeting: openMeeting, submitResponse: submitResponse, myResponse: myResponse,
+    admin: admin, enterDemo: enterDemo
   };
 });

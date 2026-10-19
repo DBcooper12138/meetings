@@ -1,16 +1,18 @@
 /* ============================================================
- *  app.js —— 会议发布与参会确认系统 主程序
- *   一级网页（后台）：#/meetings  #/meeting/:id  #/new  #/edit/:id  #/roster  #/export
- *   二级网页（参会人）：#/s/:token     —— 发这个链接给别人填写
+ *  app.js —— 主程序（v2 多用户版）
+ *
+ *  路由：
+ *   #/login  #/register  #/verify  #/forgot  #/reset
+ *   #/meetings  #/new  #/edit/:id  #/meeting/:id
+ *   #/roster  #/stats  #/account  #/admin
+ *   #/s/:token    ← 参会人填报（公开，不需要登录）
  * ============================================================ */
-(function () {
+(function (root) {
   'use strict';
 
-  var U = window.MSUtil, X = window.MSXlsx, QR = window.MSQR, DB = window.MSDB;
-  var P = window.MSParser;
-  var CFG = window.MS_CONFIG;
+  var U = root.MSUtil, X = root.MSXlsx, QR = root.MSQR, P = root.MSParser, DB = root.MSDB;
+  var CFG = root.MS_CONFIG;
 
-  /* 当前登录用的分类顺序（只影响显示顺序） */
   var CAT_ORDER = ['处长', '院长', '办公室主任', '党总支书记'];
 
   function q(id) { return document.getElementById(id); }
@@ -19,36 +21,33 @@
 
   /* ================= 全局状态 ================= */
   var S = {
-    mode: 'cloud',                 // cloud | local
+    mode: 'cloud',
     ready: false,
-    meetings: [], roster: [], responses: [],
+    session: null,
+    profile: null,
+    meetings: [], roster: [], allResponses: [], responsesCache: {},
+    plans: [], walletLogs: [], myRecharges: [],
     detailResponses: null,
-    editing: null,                 // 正在编辑的会议（新建时为草稿对象）
-    filter: 'all',
-    keyword: '',
+    filter: 'all', keyword: '',
     rosterFilter: { kw: '', cat: '' },
-    selectedRoster: {},
-    selectedInvite: {},
-    detailTab: 'att'
+    selectedRoster: {}, selectedInvite: {},
+    detailTab: 'att',
+    statsTab: 'meeting', statsFilter: 'all', statsMeetingId: '', statsPerson: '', statsPersonKw: '',
+    adminTab: 'overview', adminRechargeFilter: 'pending',
+    pendingEmail: '', resetEmail: '', flash: '',
+    recoveryMode: false, recoveryInvalid: false, wantReset: false, passwordRecovery: false,
+    linkError: '', bootError: ''
   };
 
   /* ================= 路由 ================= */
+  function queryParams() { return new URLSearchParams(location.search || ''); }
+
   function parseHash() {
     var raw = String(location.hash || '').replace(/^#\/?/, '');
-    var qs = '';
     var qi = raw.indexOf('?');
-    if (qi >= 0) { qs = raw.slice(qi + 1); raw = raw.slice(0, qi); }
-    var params = {};
-    qs.split('&').forEach(function (kv) {
-      if (!kv) return;
-      var i = kv.indexOf('=');
-      var k = i < 0 ? kv : kv.slice(0, i);
-      var v = i < 0 ? '' : kv.slice(i + 1);
-      try { params[decodeURIComponent(k)] = decodeURIComponent(v); }
-      catch (e) { params[k] = v; }
-    });
+    if (qi >= 0) raw = raw.slice(0, qi);
     var parts = raw.split('/').filter(Boolean);
-    return { name: parts[0] || 'meetings', arg: parts[1] || '', params: params };
+    return { name: parts[0] || 'meetings', arg: parts[1] || '' };
   }
 
   function go(hash) {
@@ -56,86 +55,156 @@
     location.hash = hash;
   }
 
+  /* ================= 数据加载 ================= */
+  function refreshProfile() {
+    return DB.auth.getProfile().then(function (p) { S.profile = p; return p; });
+  }
+
+  function refreshAll() {
+    return Promise.all([DB.listMeetings(), DB.listRoster(), DB.listAllResponses()])
+      .then(function (r) {
+        S.meetings = r[0] || [];
+        S.roster = r[1] || [];
+        indexResponses(r[2] || []);
+        return true;
+      }).catch(function (e) {
+        toast(String(e.message || e), 'err');
+        return false;
+      });
+  }
+
+  function refreshAccount() {
+    return Promise.all([DB.listPlans(), DB.listWalletLogs(), DB.listMyRecharges()])
+      .then(function (r) {
+        S.plans = r[0] || [];
+        S.walletLogs = r[1] || [];
+        S.myRecharges = r[2] || [];
+      }).catch(function () { /* 账户数据失败不阻塞主流程 */ });
+  }
+
+  function indexResponses(all) {
+    S.allResponses = all || [];
+    S.responsesCache = {};
+    S.allResponses.forEach(function (r) {
+      (S.responsesCache[r.meeting_id] = S.responsesCache[r.meeting_id] || []).push(r);
+    });
+  }
+
+  /* 某场会议的回执更新后，同步进全量列表并重建索引 ——
+     否则「按人员统计」用的是旧的 S.allResponses，会漏掉刚提交的回执。 */
+  function setMeetingResponses(id, list) {
+    var rest = (S.allResponses || []).filter(function (r) { return r.meeting_id !== id; });
+    indexResponses(rest.concat(list || []));
+    S.detailResponses = (S.responsesCache && S.responsesCache[id]) || [];
+  }
+
+  function afterLogin() {
+    return refreshProfile().then(function (p) {
+      if (!p) throw new Error('找不到你的账号档案。可能是注册时数据库触发器未生效，请确认已执行最新的 01_schema.sql');
+      S.profile = p;
+      S.ready = true;
+      return Promise.all([refreshAll(), refreshAccount()]);
+    }).then(function () {
+      go('#/meetings');
+      render();
+    }).catch(function (e) {
+      S.ready = false;
+      S.bootError = String(e.message || e);
+      render();
+    });
+  }
+
   /* ================= 启动 ================= */
   function boot() {
     S.mode = DB.isCloud() ? 'cloud' : 'local';
     P.setFormatters({ date: U.fmtDate, dateWeek: U.fmtDateWeek, dateTime: U.fmtDateTime });
+    bindShell();
 
-    function paint() { bindShell(); render(); }
+    var qs = queryParams();
+    S.wantReset = (qs.get('goto') === 'reset');
+    // 邮件链接可能带回错误（链接过期、已在别的浏览器用过等）
+    var errDesc = qs.get('error_description') || qs.get('error');
+    if (errDesc) S.linkError = decodeURIComponent(String(errDesc).replace(/\+/g, ' '));
 
     if (!DB.isCloud()) {
-      // 未配置云端：直接以本机模式进入，界面顶部会一直挂一条提示横幅，
-      // 想接云端时点横幅里的按钮看具体步骤（不再用"卡在配置页"的方式）。
-      S.ready = true;
-      S.mode = 'local';
-      paint();
+      DB.enterDemo().then(function () { return afterLogin(); });
       return;
     }
 
-    var secret = DB.getSecret();
-    if (!secret) { S.ready = false; S.needSecret = true; paint(); return; }
-
-    DB.ping().then(function () {
-      S.ready = true; S.needSecret = false;
-      return refreshAll().then(function (ok) {
-        if (!ok) toast('数据加载失败，请检查网络后刷新页面', 'err');
-      });
-    }).catch(function (err) {
-      S.ready = false;
-      var m = String(err && err.message || err);
-      if (m === 'ADMIN_SECRET_WRONG' || (err && err.code === 'ADMIN_SECRET_WRONG')) {
-        DB.clearSecret(); S.needSecret = true; S.setupError = 'wrong';
-      } else if (m === 'SCHEMA_MISSING' || (err && err.code === 'SCHEMA_MISSING')) {
-        S.setupError = 'schema';
-      } else if (/config\/config\.js/.test(m)) {
-        S.setupError = 'config:' + m;
-      } else {
-        S.setupError = 'net:' + m;
+    DB.auth.getSession().then(function (session) {
+      S.session = session;
+      // 从"重置密码"邮件回来：有会话就说明链接有效，可以改密码
+      if (S.wantReset) {
+        if (session) { S.recoveryMode = true; S.recoveryInvalid = false; }
+        else { S.recoveryInvalid = true; }
+        // 把 #access_token=... 换成正常路由（必须在 getSession 之后改，
+        // 否则 supabase 就没机会解析链接里的 token 了）
+        try {
+          history.replaceState(null, '', location.pathname + '?goto=reset#/reset');
+        } catch (e) { /* 忽略 */ }
       }
-      paint();
-    });
-  }
-
-  function refreshAll() {
-    return Promise.all([DB.listMeetings(), DB.listRoster(), DB.listAllResponses()]).then(function (r) {
-      S.meetings = r[0] || [];
-      S.roster = r[1] || [];
-      indexResponses(r[2] || []);
-      return true;
+      if (!session) { S.ready = false; render(); return; }
+      return refreshProfile().then(function (p) {
+        if (!p) { S.ready = false; S.bootError = ''; render(); return; }
+        S.profile = p;
+        S.ready = true;
+        return Promise.all([refreshAll(), refreshAccount()]).then(function () {
+          // 清除邮件链接带来的 #access_token=... 之类的残余，避免地址栏难看
+          cleanAuthHash();
+          render();
+        });
+      });
     }).catch(function (e) {
-      toast(String(e.message || e), 'err');
-      return false;
+      S.ready = false;
+      S.bootError = String(e.message || e);
+      render();
+    });
+
+    DB.auth.onAuthChange(function (event) {
+      if (event === 'SIGNED_OUT') {
+        S.profile = null; S.session = null; S.ready = false;
+        go('#/login');
+      } else if (event === 'PASSWORD_RECOVERY') {
+        S.passwordRecovery = true;
+        S.recoveryMode = true;
+        S.recoveryInvalid = false;
+        go('#/reset');
+        render();
+      }
     });
   }
 
-  /* 把全部回执按 meeting_id 放进缓存，供看板统计 */
-  function indexResponses(all) {
-    S.responsesCache = {};
-    (all || []).forEach(function (r) {
-      (S.responsesCache[r.meeting_id] = S.responsesCache[r.meeting_id] || []).push(r);
-    });
-    return S.responsesCache;
+  /* 把 #access_token=... 这类邮件链接残留从地址栏清掉 */
+  function cleanAuthHash() {
+    var h = String(location.hash || '');
+    if (!/access_token|refresh_token|error_description|type=recovery|type=signup/.test(h)) return;
+    try {
+      history.replaceState(null, '', location.pathname + location.search + '#/meetings');
+    } catch (e) { /* 忽略 */ }
   }
 
-  /* ================= 侧边栏 / 顶栏交互 ================= */
+  /* ================= 外壳 ================= */
   function bindShell() {
-    var app = q('app');
-    app.addEventListener('click', function (e) {
+    q('app').addEventListener('click', function (e) {
       var t = e.target.closest('[data-go]');
       if (t) { e.preventDefault(); go(t.getAttribute('data-go')); }
     });
   }
 
   function shell(active, title, actions, body) {
+    var p = S.profile || {};
     var nav = [
       ['meetings', '📋', '会议看板', '#/meetings'],
       ['new', '➕', '发布会议', '#/new'],
       ['roster', '👥', '名单管理', '#/roster'],
-      ['export', '📤', '导出统计', '#/export']
+      ['stats', '📊', '统计', '#/stats'],
+      ['account', '💰', '我的账户', '#/account']
     ];
-    var dotCls = S.mode === 'local' ? 'local' : (S.ready ? '' : 'bad');
-    var dotTxt = S.mode === 'local' ? '本机模式（数据只存这台电脑）'
-               : (S.ready ? '已连接云端数据库' : '云端未连接');
+    if (p.is_super) nav.push(['admin', '🛡', '超级管理员', '#/admin']);
+
+    var dotCls = S.mode === 'local' ? 'local' : 'ok';
+    var dotTxt = S.mode === 'local' ? '本机演示模式（数据只在本机）' : '已连接云端';
+
     return '' +
       '<div class="shell">' +
         '<aside class="side">' +
@@ -145,201 +214,106 @@
             return '<a href="' + n[3] + '" class="' + (active === n[0] ? 'on' : '') + '">' +
                    '<span class="ico">' + n[1] + '</span>' + n[2] + '</a>';
           }).join('') + '</nav>' +
+          '<div class="side-user">' +
+            '<div class="su-name">' + h(p.name || '未登录') +
+              (p.is_super ? ' <span class="tag dark">超管</span>' : '') + '</div>' +
+            '<div class="su-sub">工号 ' + h(p.emp_no || '—') + '</div>' +
+            '<button class="btn ghost sm" id="btn-logout" style="width:100%;margin-top:8px">退出登录</button>' +
+          '</div>' +
           '<div class="foot"><span class="dot ' + dotCls + '"></span>' + h(dotTxt) + '</div>' +
         '</aside>' +
         '<div class="main">' +
-          '<div class="topbar"><h1>' + h(title) + '</h1><div class="sp"></div>' +
-            (actions || '') + '</div>' +
+          '<div class="topbar"><h1>' + h(title) + '</h1><div class="sp"></div>' + (actions || '') + '</div>' +
           '<div class="content">' + body + '</div>' +
         '</div>' +
       '</div>';
   }
 
-  /* ================= 主渲染 ================= */
-  function render() {
-    var r = parseHash();
-    var app = q('app');
-
-    if (r.name === 's') { app.innerHTML = viewShare(r.arg); afterShare(r.arg); return; }
-
-    if (!S.ready) { app.innerHTML = viewGate(); afterGate(); return; }
-
-    switch (r.name) {
-      case 'meeting': app.innerHTML = viewDetail(r.arg); afterDetail(r.arg); break;
-      case 'new':     app.innerHTML = viewForm(null); bindForm(null); break;
-      case 'edit':    app.innerHTML = viewForm(r.arg); bindForm(r.arg); break;
-      case 'roster':  app.innerHTML = viewRoster(); afterRoster(); break;
-      case 'export':  app.innerHTML = viewExport(); afterExport(); break;
-      default:        app.innerHTML = viewMeetings(); afterMeetings();
-    }
-  }
-
-  /* ============================================================
-   *  未就绪提示（未配置 / 口令缺失 / 表结构缺失）
-   * ============================================================ */
-  function viewGate() {
-    if (S.mode === 'local') {
-      return shell('meetings', '会议看板', '<button class="btn" id="gate-setup">☁ 接入云端数据库</button>',
-        '<div class="notice warn">' + localNotice() + '</div>' +
-        '<div class="card"><div class="empty"><span class="big">📋</span>' +
-        '本机模式已就绪。可以先用左侧「发布会议」熟悉流程；<br>' +
-        '要让别人扫码在自己手机上填报，请点右上角「接入云端数据库」。' +
-        '</div></div>');
-    }
-
-    var setup = String(S.setupError || '');
-    var cfgInfo = '';
-    if (setup.indexOf('config:') === 0) {
-      cfgInfo = '<div class="notice err"><b>config/config.js 里的参数不对。</b><br>' +
-                h(setup.slice(7)) +
-                '<br>正确写法：<code>SUPABASE_URL: \'https://你的项目名.supabase.co\',</code>' +
-                '（只填域名，不要重复 https://，不要带 /rest/v1/）</div>';
-    }
-    var msg;
-    if (setup === 'schema') {
-      msg = '<div class="notice err"><b>数据库里还没有建表。</b><br>' +
-            '请把 <code>supabase/01_schema.sql</code> 整段粘贴到 Supabase 的 SQL Editor 里执行一次，再刷新本页。</div>';
-    } else if (setup.indexOf('config:') === 0) {
-      msg = cfgInfo;
-    } else if (setup === 'wrong' || S.needSecret || setup === '') {
-      msg = '<div class="notice warn"><b>请输入后台口令。</b><br>' +
-            '口令就是你在 SQL 里执行 <code>select public.set_admin_secret(\'...\');</code> 时设置的那个。' +
-            '口令只保存在本机浏览器，不会写进网页源码。</div>';
-    } else {
-      msg = '<div class="notice err"><b>连接云端失败。</b><br>' +
-            h(setup.replace(/^net:/, '')) +
-            '<br><br>依次检查：① <code>config/config.js</code> 的 URL 和密钥；' +
-            '② 把 URL 粘到浏览器新标签页能否打开；③ Supabase 项目是否被暂停（控制台会显示 Paused）。</div>';
-    }
-    return '<div class="content" style="max-width:560px;margin:0 auto;padding-top:64px">' +
-      '<div class="card"><div class="card-h"><h2>' + h(CFG.APP_NAME || '会议系统') + '</h2></div>' +
-      '<div class="card-b">' + msg +
-      '<label class="f"><span class="lb">后台口令</span>' +
-      '<input type="password" class="input" id="gate-secret" placeholder="请输入后台口令" autocomplete="current-password"></label>' +
-      '<div class="btn-row"><button class="btn" id="gate-go">进入后台</button>' +
-      '<button class="btn ghost" onclick="location.reload()">刷新</button>' +
-      '<button class="btn ghost" id="gate-diag">查看配置详情</button></div>' +
-      '</div></div></div>';
-  }
-
-  /* 配置体检面板：口令因为敏感不显示，URL 和密钥只显示可判断格式的信息 */
-  function openConfigDiag() {
-    var r = (DB.configCheck && DB.configCheck()) || {};
-    var key = String(r.key || '');
-    var rows = [
-      ['config.js 里填的地址', r.urlRaw || '（空）'],
-      ['程序实际使用的地址', r.url || '（无法识别）'],
-      ['地址格式', r.urlOk ? '✅ 正常' : '❌ 不正确'],
-      ['密钥长度', key ? key.length + ' 个字符' : '（空）'],
-      ['密钥开头', key ? key.slice(0, 12) + '…' : '—'],
-      ['密钥格式', r.keyOk ? '✅ 正常' : '❌ 不正确（应是以 eyJ 开头的完整 anon public 密钥）'],
-      ['当前模式', S.mode === 'cloud' ? '云端' : '本机（未连云）']
-    ];
-    if (r.urlChanged) {
-      rows.push(['提示', '已自动纠正地址格式（去掉了重复的 https:// 和 /rest/v1/）']);
-    }
-    var mask = document.createElement('div');
-    mask.className = 'modal-mask';
-    mask.innerHTML = '<div class="modal" style="max-width:620px">' +
-      '<div class="modal-body" style="white-space:normal">' +
-      '<div class="modal-title">配置体检</div>' +
-      '<table style="width:100%;border-collapse:collapse;font-size:13px">' +
-      rows.map(function (x) {
-        return '<tr><td style="padding:5px 8px;color:#475569;white-space:nowrap;vertical-align:top">' +
-          h(x[0]) + '</td><td style="padding:5px 8px;word-break:break-all">' + h(x[1]) + '</td></tr>';
-      }).join('') +
-      '</table>' +
-      '<div class="notice info" style="margin:14px 0 0">' +
-      '地址正例：<code>https://abcdefghijk.supabase.co</code><br>' +
-      '常见错误：写成 <code>https://https://xxx.supabase.co/rest/v1/</code>，' +
-      '或少了 <code>https://</code>，或结尾多了斜杠。</div>' +
-      '</div><div class="modal-foot"><button class="btn" data-x="0">关闭</button></div></div>';
-    document.body.appendChild(mask);
-    mask.addEventListener('click', function (e) {
-      if (e.target.closest('[data-x]') || e.target === mask) mask.remove();
+  function afterShell() {
+    var lo = q('btn-logout');
+    if (lo) lo.addEventListener('click', function () {
+      confirmBox('确定退出登录？').then(function (ok) {
+        if (!ok) return;
+        DB.auth.signOut().then(function () {
+          S.profile = null; S.session = null; S.ready = false;
+          go('#/login');
+          render();
+        });
+      });
     });
   }
 
-  function afterGate() {
-    var diagBtn = q('gate-diag');
-    if (diagBtn) diagBtn.addEventListener('click', openConfigDiag);
-    var localBtn = q('gate-setup');
-    if (localBtn) {
-      localBtn.addEventListener('click', function () {
-        var mask = document.createElement('div');
-        mask.className = 'modal-mask';
-        mask.innerHTML = '<div class="modal" style="max-width:620px">' +
-          '<div class="modal-body" style="white-space:normal">' +
-          '<div class="modal-title">接入云端数据库（约 15 分钟，免费）</div>' +
-          '<ol style="padding-left:20px;line-height:1.9;margin:0">' +
-          '<li>打开 <a href="https://supabase.com" target="_blank" rel="noopener">supabase.com</a> 注册并新建项目，' +
-          '<b>Region 选 Singapore</b>（国内访问最快）</li>' +
-          '<li>左侧 <b>SQL Editor</b> → New query → 把项目里 <code>supabase/01_schema.sql</code> ' +
-          '<b>整段</b>粘进去执行（应显示 Success）</li>' +
-          '<li>再新开一个 query，执行：<br><code>select public.set_admin_secret(\'你的后台口令\');</code><br>' +
-          '执行完把这行删掉，别留明文口令</li>' +
-          '<li>左侧 <b>Project Settings → Data API</b> 复制 <b>Project URL</b>；' +
-          '到 <b>API Keys</b> 复制 <b>anon public</b> 密钥（<b>绝不能用 service_role</b>）</li>' +
-          '<li>用记事本打开 <code>config/config.js</code>，把这两个值填进去并保存</li>' +
-          '<li>刷新本页 —— 顶部横幅消失就说明连上了</li>' +
-          '</ol>' +
-          '<div class="notice info" style="margin:14px 0 0">本机模式里已经录入的会议和名单不会自动搬到云端，' +
-          '接上云端后请重新导入名单、重新发布会议。</div>' +
-          '</div><div class="modal-foot"><button class="btn" data-x="0">知道了</button></div></div>';
-        document.body.appendChild(mask);
-        mask.addEventListener('click', function (e) {
-          if (e.target.closest('[data-x]') || e.target === mask) mask.remove();
-        });
-      });
+  /* ================= 渲染 ================= */
+  function render() {
+    var r = parseHash();
+    var app = q('app');
+    var wrap = function (html) { app.innerHTML = html; afterShell(); };
+
+    if (r.name === 's') {
+      app.innerHTML = viewShare(r.arg);
+      afterShare(r.arg);
+      return;
     }
-    var btn = q('gate-go'), inp = q('gate-secret');
-    if (!btn) return;
-    function submit() {
-      var v = (inp.value || '').trim();
-      if (!v) { toast('请输入口令', 'warn'); return; }
-      DB.setSecret(v);
-      btn.disabled = true; btn.textContent = '正在校验…';
-      DB.ping().then(function () {
-        toast('口令正确，已进入后台', 'ok');
-        S.needSecret = false; S.ready = true; S.setupError = null;
-        return refreshAll();
-      }).then(function () {
-        location.hash = '#/meetings'; render();
-      }).catch(function (e) {
-        var msg = String(e && e.message || e);
-        // 只有真的是口令不对才清掉口令；网络/配置问题不要把用户的口令丢掉，
-        // 否则会把「连不上」误报成「口令错误」，让人一直改口令。
-        if (e && (e.code === 'ADMIN_SECRET_WRONG' || msg === 'ADMIN_SECRET_WRONG')) {
-          DB.clearSecret();
-          S.setupError = 'wrong'; S.ready = false;
-          inp.value = '';
-          render();
-          toast('口令不正确，请重新输入', 'err');
-        } else {
-          S.ready = false;
-          S.setupError = (e && e.code === 'SCHEMA_MISSING') ? 'schema'
-                       : (/config\/config\.js/.test(msg) ? 'config:' + msg : 'net:' + msg);
-          render();
-          toast(msg, 'err');
-        }
-      }).then(function () { btn.disabled = false; });
+
+    if (!S.ready) {
+      var authed = { login: 1, register: 1, verify: 1, forgot: 1, reset: 1 };
+      if (!authed[r.name]) r = { name: 'login', arg: '' };
+      if (r.name === 'register') { app.innerHTML = MSAuth.viewRegister(); MSAuth.bindRegister(); return; }
+      if (r.name === 'verify') { app.innerHTML = MSAuth.viewVerify(); MSAuth.bindVerify(); return; }
+      if (r.name === 'forgot') { app.innerHTML = MSAuth.viewForgot(); MSAuth.bindForgot(); return; }
+      if (r.name === 'reset') { app.innerHTML = MSAuth.viewReset(); MSAuth.bindReset(); return; }
+      if (S.bootError) { app.innerHTML = bootErrorHtml(); bindBootError(); return; }
+      app.innerHTML = MSAuth.viewLogin();
+      MSAuth.bindLogin();
+      return;
     }
-    btn.addEventListener('click', submit);
-    inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
-    inp.focus();
+
+    // 已登录状态下的"重置密码"（点邮件链接回来，已有临时会话）
+    if (r.name === 'reset' && S.recoveryMode) {
+      app.innerHTML = MSAuth.viewReset();
+      MSAuth.bindReset();
+      return;
+    }
+
+    if (r.name === 'admin') {
+      if (!S.profile || !S.profile.is_super) { go('#/meetings'); return; }
+      wrap(MSAdmin.viewAdmin());
+      MSAdmin.bindAdmin();
+      return;
+    }
+
+    switch (r.name) {
+      case 'meeting': wrap(viewDetail(r.arg)); afterDetail(r.arg); break;
+      case 'new': wrap(viewForm(null)); bindForm(null); break;
+      case 'edit': wrap(viewForm(r.arg)); bindForm(r.arg); break;
+      case 'roster': wrap(viewRoster()); afterRoster(); break;
+      case 'stats': wrap(MSStats.viewStats()); MSStats.bindStats(); break;
+      case 'account': wrap(MSAuth.viewAccount()); MSAuth.bindAccount(); break;
+      case 'login': case 'register': case 'verify': case 'forgot': case 'reset':
+        go('#/meetings'); return;
+      default: wrap(viewMeetings()); afterMeetings();
+    }
   }
 
-  function localNotice() {
-    return '<b>当前是「本机模式」演示。</b>功能都能用，但数据只存在这台电脑的浏览器里：' +
-           '别人用手机打开会议链接填不了你自己电脑上的数据，所以<strong>会议发布功能需要先接上云端数据库</strong>。';
+  function bootErrorHtml() {
+    return '<div class="content" style="max-width:600px;margin:0 auto;padding-top:60px">' +
+      '<div class="card"><div class="card-h"><h2>启动失败</h2></div><div class="card-b">' +
+      '<div class="notice err">' + h(S.bootError) + '</div>' +
+      '<div class="btn-row"><button class="btn" onclick="location.reload()">刷新页面</button>' +
+      '<button class="btn ghost" id="be-logout">重新登录</button></div></div></div></div>';
+  }
+  function bindBootError() {
+    var b = q('be-logout');
+    if (b) b.addEventListener('click', function () {
+      DB.auth.signOut().then(function () { location.reload(); });
+    });
   }
 
   /* ============================================================
    *  会议看板
    * ============================================================ */
   function statOf(m) {
-    var att = buildAttendance(m, (S.responsesCache && S.responsesCache[m.id]) || []);
-    return att.stats;
+    return P.buildAttendance(m, (S.responsesCache && S.responsesCache[m.id]) || []).stats;
   }
 
   function viewMeetings() {
@@ -348,7 +322,6 @@
       if (da !== db) return da < db ? 1 : -1;
       return String(b.created_at || '') < String(a.created_at || '') ? -1 : 1;
     });
-
     if (S.filter === 'upcoming') {
       var t = U.todayISO();
       list = list.filter(function (m) { return (m.meet_date || '') >= t; });
@@ -356,7 +329,6 @@
       var t2 = U.todayISO();
       list = list.filter(function (m) { return (m.meet_date || '') < t2; });
     }
-
     if (S.keyword) {
       var kw = S.keyword.toLowerCase();
       list = list.filter(function (m) {
@@ -369,69 +341,70 @@
     var cards = list.map(function (m) {
       var st = statOf(m);
       var inviteN = st.invited;
-      var donePct = inviteN ? Math.round((st.answered) * 100 / inviteN) : 0;
+      var donePct = inviteN ? Math.round(st.answered * 100 / inviteN) : 0;
       var closed = m.deadline && Date.now() > new Date(m.deadline).getTime();
-      return '' +
-        '<div class="mcard" data-go="#/meeting/' + h(m.id) + '">' +
-          '<div class="row1">' +
-            '<h3>' + h(m.title || '未命名会议') + '</h3>' +
-            (closed ? '<span class="tag gray">已截止</span>' : '') +
-          '</div>' +
-          '<div class="meta">' +
-            '<span>🗓 <b>' + h(U.fmtDateWeek(m.meet_date) || '未定日期') + '</b>' +
-              (m.start_time ? ' ' + h(m.start_time) + (m.end_time ? '–' + h(m.end_time) : '') : '') + '</span>' +
-            '<span>📍 ' + h(m.location || '地点待定') + '</span>' +
-            (m.convene_dept ? '<span>🏛 ' + h(m.convene_dept) + '</span>' : '') +
-          '</div>' +
-          '<div class="bar" title="已确认 ' + st.yes + ' · 不参会 ' + st.no + ' · 待确认 ' + st.pending + '">' +
-            '<i class="y" style="width:' + (inviteN ? (st.yes * 100 / inviteN) : 0) + '%"></i>' +
-            '<i class="n" style="width:' + (inviteN ? (st.no * 100 / inviteN) : 0) + '%"></i>' +
-          '</div>' +
-          '<div class="nums">' +
-            '<span>参会 <b style="color:#15803d">' + st.yes + '</b></span>' +
-            '<span>不参会 <b style="color:#b91c1c">' + st.no + '</b></span>' +
-            '<span>待确认 <b style="color:#b45309">' + st.pending + '</b></span>' +
-            '<span class="mini" style="color:#94a3b8">回执率 ' + donePct + '%</span>' +
-          '</div>' +
-          '<div class="foot">' +
-            '<span class="tag blue">受邀 ' + inviteN + ' 人</span>' +
-            (st.outside ? '<span class="tag amber">名单外 ' + st.outside + '</span>' : '') +
-            '<span class="sp"></span>' +
-            '<button class="btn ghost sm" data-copy="' + h(shareUrl(m.share_token)) + '">复制链接</button>' +
-          '</div>' +
-        '</div>';
+      return '<div class="mcard" data-go="#/meeting/' + h(m.id) + '">' +
+        '<div class="row1"><h3>' + h(m.title || '未命名会议') + '</h3>' +
+          (closed ? '<span class="tag gray">已截止</span>' : '') + '</div>' +
+        '<div class="meta">' +
+          '<span>🗓 <b>' + h(U.fmtDateWeek(m.meet_date) || '未定日期') + '</b>' +
+            (m.start_time ? ' ' + h(m.start_time) + (m.end_time ? '–' + h(m.end_time) : '') : '') + '</span>' +
+          '<span>📍 ' + h(m.location || '地点待定') + '</span>' +
+          (m.convene_dept ? '<span>🏛 ' + h(m.convene_dept) + '</span>' : '') +
+        '</div>' +
+        '<div class="bar"><i class="y" style="width:' + (inviteN ? (st.yes * 100 / inviteN) : 0) + '%"></i>' +
+          '<i class="n" style="width:' + (inviteN ? (st.no * 100 / inviteN) : 0) + '%"></i></div>' +
+        '<div class="nums">' +
+          '<span>参会 <b style="color:#15803d">' + st.yes + '</b></span>' +
+          '<span>不参会 <b style="color:#b91c1c">' + st.no + '</b></span>' +
+          '<span>待确认 <b style="color:#b45309">' + st.pending + '</b></span>' +
+          '<span class="mini" style="color:#94a3b8">回执率 ' + donePct + '%</span>' +
+        '</div>' +
+        '<div class="foot"><span class="tag blue">受邀 ' + inviteN + ' 人</span>' +
+          (st.outside ? '<span class="tag amber">名单外 ' + st.outside + '</span>' : '') +
+          '<span class="sp"></span>' +
+          '<button class="btn ghost sm" data-copy="' + h(shareUrl(m.share_token)) + '">复制链接</button>' +
+        '</div></div>';
     }).join('');
 
-    var total = S.meetings.length;
+    var p = S.profile || {};
+    var planWarn = '';
+    var planValid = p.is_super || (p.plan_expires_at && new Date(p.plan_expires_at).getTime() > Date.now());
+    if (!planValid) {
+      planWarn = '<div class="notice warn"><b>你的套餐还没开通或已过期</b>，暂时无法发布新会议。' +
+        '<a href="#/account">去「我的账户」充值并购买套餐 →</a></div>';
+    }
+    if (S.mode === 'local') {
+      planWarn = '<div class="notice warn"><b>当前是本机演示模式</b>：数据只存在这台电脑的浏览器里，' +
+        '别人用手机打不开你的会议链接。</div>' + planWarn;
+    }
+
     return shell('meetings', '会议看板',
-      '<input class="input" style="width:210px" id="mkw" placeholder="搜索会议名称/地点" value="' + h(S.keyword) + '">' +
+      '<input class="input" style="width:200px" id="mkw" placeholder="搜索会议名称/地点" value="' + h(S.keyword) + '">' +
       '<button class="btn" data-go="#/new">＋ 发布会议</button>',
-      (S.mode === 'local' ? '<div class="notice warn">' + localNotice() + '</div>' : '') +
+      planWarn +
       '<div class="btn-row" style="margin-bottom:16px">' +
         ['all:全部', 'upcoming:未召开', 'past:已结束'].map(function (x) {
           var k = x.split(':')[0], v = x.split(':')[1];
           return '<button class="btn ' + (S.filter === k ? '' : 'ghost') + ' sm" data-filter="' + k + '">' + v + '</button>';
         }).join('') +
-        '<span class="hint" style="margin-left:6px">共 ' + total + ' 场会议</span>' +
+        '<span class="hint" style="margin-left:6px">共 ' + S.meetings.length + ' 场会议</span>' +
       '</div>' +
       (list.length
         ? '<div class="grid c2">' + cards + '</div>'
         : '<div class="card"><div class="empty"><span class="big">📋</span>' +
-          (total ? '没有符合条件的会议' : '还没有会议，点右上角「＋ 发布会议」开始') +
-          '</div></div>')
+          (S.meetings.length ? '没有符合条件的会议' : '还没有会议，点右上角「＋ 发布会议」开始') + '</div></div>')
     );
   }
 
   function afterMeetings() {
     var kw = q('mkw');
-    if (kw) {
-      kw.addEventListener('input', function () {
-        var pos = kw.selectionStart;
-        S.keyword = kw.value.trim();
-        render();
-        restoreCaret('mkw', pos);
-      });
-    }
+    if (kw) kw.addEventListener('input', function () {
+      var pos = kw.selectionStart;
+      S.keyword = kw.value.trim();
+      render();
+      restoreCaret('mkw', pos);
+    });
     document.querySelectorAll('[data-filter]').forEach(function (b) {
       b.addEventListener('click', function () { S.filter = b.getAttribute('data-filter'); render(); });
     });
@@ -442,18 +415,18 @@
     document.querySelectorAll('[data-copy]').forEach(function (b) {
       b.addEventListener('click', function (e) {
         e.stopPropagation(); e.preventDefault();
-        copyText(b.getAttribute('data-copy')).then(function () { toast('链接已复制', 'ok'); });
+        copyText(b.getAttribute('data-copy')).then(function () { toast('已复制', 'ok'); });
       });
     });
   }
 
   function copyText(t) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      return navigator.clipboard.writeText(t).catch(function () { return fallbackCopy(t); });
+      return navigator.clipboard.writeText(t).catch(function () { fallbackCopy(t); });
     }
-    return Promise.resolve(fallbackCopy(t));
+    fallbackCopy(t);
+    return Promise.resolve();
   }
-
   function fallbackCopy(t) {
     var ta = document.createElement('textarea');
     ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
@@ -463,27 +436,7 @@
   }
 
   function shareUrl(token) {
-    var base = location.href.split('#')[0];
-    return base + '#/s/' + token;
-  }
-
-  /* ============================================================
-   *  参会情况汇总（受邀名单 × 回执）—— 实际逻辑在 parser.js
-   * ============================================================ */
-  var buildAttendance = P.buildAttendance;
-  var sortAttRows = P.sortRows;
-
-  function statusTag(st) {
-    if (st === 'yes') return '<span class="tag green">参加</span>';
-    if (st === 'no') return '<span class="tag red">不参加</span>';
-    return '<span class="tag amber">待确认</span>';
-  }
-
-  function progressBar(st) {
-    var n = st.invited || 1;
-    return '<div class="bar" style="margin:10px 0 4px">' +
-      '<i class="y" style="width:' + (st.yes * 100 / n) + '%"></i>' +
-      '<i class="n" style="width:' + (st.no * 100 / n) + '%"></i></div>';
+    return location.href.split('#')[0] + '#/s/' + token;
   }
 
   /* ============================================================
@@ -496,28 +449,13 @@
         '<button class="btn ghost" data-go="#/meetings">返回看板</button>',
         '<div class="card"><div class="empty"><span class="big">🔍</span>找不到这场会议，可能已被删除</div></div>');
     }
-    window.__curMeeting = m;
-    // 先用手头已有的回执渲染，再向云端拉一次最新的
+    root.__curMeeting = m;
     S.detailResponses = (S.responsesCache && S.responsesCache[m.id]) || [];
-    var att = buildAttendance(m, S.detailResponses);
+    var att = P.buildAttendance(m, S.detailResponses);
     var st = att.stats;
-    var rows = sortAttRows(att.rows);
-
+    var rows = P.sortRows(att.rows);
     var closed = m.deadline && Date.now() > new Date(m.deadline).getTime();
     var url = shareUrl(m.share_token);
-
-    var info =
-      '<div class="kv-list">' +
-        kv('会议时间', (U.fmtDateWeek(m.meet_date) || '未定') +
-           (m.start_time ? '<br>' + h(m.start_time) + (m.end_time ? '–' + h(m.end_time) : '') : '')) +
-        kv('会议地点', m.location || '待定') +
-        kv('主办/召集', m.convene_dept || '—') +
-        kv('主持人', m.host || '—') +
-        kv('联系人', m.contact || '—') +
-        kv('填报截止', m.deadline ? U.fmtDateTime(m.deadline) + (closed ? '（已截止）' : '') : '不限') +
-      '</div>' +
-      (m.agenda ? '<div style="margin-top:16px"><div class="kv"><div class="k">议程 / 说明</div>' +
-        '<div class="v">' + U.escLines(m.agenda) + '</div></div></div>' : '');
 
     var visible = rows.filter(function (r) {
       if (S.detailTab === 'yes') return r.status === 'yes';
@@ -525,6 +463,18 @@
       if (S.detailTab === 'pending') return r.status === 'pending';
       return true;
     });
+
+    var info = '<div class="kv-list">' +
+      kv('会议时间', (U.fmtDateWeek(m.meet_date) || '未定') +
+         (m.start_time ? '<br>' + h(m.start_time) + (m.end_time ? '–' + h(m.end_time) : '') : '')) +
+      kv('会议地点', m.location || '待定') +
+      kv('主办/召集', m.convene_dept || '—') +
+      kv('主持人', m.host || '—') +
+      kv('联系人', m.contact || '—') +
+      kv('填报截止', m.deadline ? U.fmtDateTime(m.deadline) + (closed ? '（已截止）' : '') : '不限') +
+    '</div>' +
+    (m.agenda ? '<div style="margin-top:16px"><div class="kv"><div class="k">议程 / 说明</div>' +
+      '<div class="v">' + U.escLines(m.agenda) + '</div></div></div>' : '');
 
     var body =
       '<div class="btn-row" style="margin-bottom:14px">' +
@@ -551,12 +501,11 @@
           '<img class="qr-img" id="d-qr-img" alt="会议二维码">' +
           '<div class="hint">手机上长按或截图保存，发到微信群里最方便。</div>' +
         '</div>' +
-        '<div class="hint">受邀 ' + st.invited + ' 人。别人打开链接后填写姓名并选择是否参会，' +
-        '结果会自动回到本页（本页每 ' + Math.round((CFG.AUTO_REFRESH_MS || 30000) / 1000) + ' 秒自动刷新一次）。</div>' +
+        '<div class="hint">受邀 ' + st.invited + ' 人。别人打开链接填写姓名并选择是否参会，' +
+        '结果会自动回到本页（每 ' + Math.round((CFG.AUTO_REFRESH_MS || 30000) / 1000) + ' 秒自动刷新）。</div>' +
         (st.pending ? '<div class="btn-row" style="margin-top:12px">' +
           '<button class="btn ghost sm" data-copy="' + h(remindText(m, att, url)) + '">复制催办文本（待确认 ' +
-          st.pending + ' 人）</button>' +
-          '<span class="hint">可直接粘到微信群里，无需再手打名单</span></div>' : '') +
+          st.pending + ' 人）</button></div>' : '') +
       '</div></div>' +
 
       '<div class="grid c3" style="margin-bottom:14px">' +
@@ -567,20 +516,19 @@
       '</div>' +
 
       '<div class="card"><div class="card-h"><h2>参会人员情况</h2>' +
-        '<div class="sp" style="flex:1"></div>' +
+        '<span class="sp" style="flex:1"></span>' +
         [['att', '全部'], ['yes', '已确认参会'], ['no', '不参会'], ['pending', '待确认']].map(function (t) {
           return '<button class="btn ' + (S.detailTab === t[0] ? '' : 'ghost') + ' sm" data-tab="' + t[0] + '">' +
-                 t[1] + (t[0] === 'att' ? ' ' + rows.length : '') + '</button>';
+                 t[1] + '</button>';
         }).join('') +
-      '</div>' +
-      progressBar(st) +
-      '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
-        '<th>#</th><th>姓名</th><th>类别</th><th>部门</th><th>是否参会</th>' +
+      '</div><div class="tbl-wrap"><table class="tbl"><thead><tr>' +
+        '<th>#</th><th>工号</th><th>姓名</th><th>类别</th><th>部门</th><th>是否参会</th>' +
         '<th>不参会原因</th><th>备注</th><th>回执时间</th>' +
       '</tr></thead><tbody>' +
         (visible.length ? visible.map(function (r, i) {
           return '<tr>' +
             '<td class="ctr mini">' + (i + 1) + '</td>' +
+            '<td class="mini">' + h(r.emp_no || '—') + '</td>' +
             '<td class="name">' + h(r.name) + (r.on_list ? '' : ' <span class="tag amber">名单外</span>') + '</td>' +
             '<td>' + h(r.category || '—') + '</td>' +
             '<td>' + h(r.dept || '—') + '</td>' +
@@ -589,9 +537,8 @@
             '<td>' + (r.note ? h(r.note) : '<span class="mini">—</span>') + '</td>' +
             '<td class="mini">' + (r.updated_at ? U.fmtDateTime(r.updated_at) : '—') + '</td>' +
           '</tr>';
-        }).join('') : '<tr><td colspan="8"><div class="empty">这个分类下暂时没有人</div></td></tr>') +
-      '</tbody></table></div>' +
-      '</div>';
+        }).join('') : '<tr><td colspan="9"><div class="empty">这个分类下暂时没有人</div></td></tr>') +
+      '</tbody></table></div></div>';
 
     return shell('meetings', '会议详情', '', body);
   }
@@ -599,15 +546,18 @@
   function kv(k, v) {
     return '<div class="kv"><div class="k">' + h(k) + '</div><div class="v">' + (v || '—') + '</div></div>';
   }
+  function statusTag(st) {
+    if (st === 'yes') return '<span class="tag green">参加</span>';
+    if (st === 'no') return '<span class="tag red">不参加</span>';
+    return '<span class="tag amber">待确认</span>';
+  }
 
-  /* 生成一段可以直接粘到群里的催办文本（已确认的人不再列出） */
   function remindText(m, att, url) {
     var pending = att.rows.filter(function (r) { return r.status === 'pending'; });
-    var lines = [];
-    lines.push('【参会确认提醒】' + (m.title || ''));
+    var lines = ['【参会确认提醒】' + (m.title || '')];
     if (m.meet_date) {
       lines.push('时间：' + U.fmtDateWeek(m.meet_date) +
-                 (m.start_time ? ' ' + m.start_time + (m.end_time ? '–' + m.end_time : '') : ''));
+        (m.start_time ? ' ' + m.start_time + (m.end_time ? '–' + m.end_time : '') : ''));
     }
     if (m.location) lines.push('地点：' + m.location);
     if (m.deadline) lines.push('请于 ' + U.fmtDateTime(m.deadline) + ' 前确认');
@@ -620,14 +570,14 @@
   }
 
   function afterDetail(id) {
-    var m = window.__curMeeting;
+    var m = root.__curMeeting;
     if (!m) return;
     document.querySelectorAll('[data-tab]').forEach(function (b) {
       b.addEventListener('click', function () { S.detailTab = b.getAttribute('data-tab'); render(); });
     });
     var cp = q('d-copy');
     if (cp) cp.addEventListener('click', function () {
-      copyText(q('d-url').value).then(function () { toast('链接已复制，可以发给参会人员了', 'ok'); });
+      copyText(q('d-url').value).then(function () { toast('链接已复制', 'ok'); });
     });
     var qb = q('d-qr');
     if (qb) qb.addEventListener('click', function () {
@@ -636,23 +586,25 @@
         try { q('d-qr-img').src = QR.toPngDataUrl(q('d-url').value, 5); }
         catch (e) { toast('二维码生成失败：' + e.message, 'err'); return; }
         box.style.display = 'block';
-      } else { box.style.display = 'none'; }
+      } else box.style.display = 'none';
     });
     var rf = q('d-refresh');
     if (rf) rf.addEventListener('click', function () {
       rf.disabled = true; rf.textContent = '正在刷新…';
       DB.listResponses(id).then(function (rs) {
-        S.detailResponses = rs || [];
-        toast('已刷新，共收到 ' + S.detailResponses.length + ' 条回执', 'ok');
+        setMeetingResponses(id, rs || []);
+        toast('已刷新，共 ' + S.detailResponses.length + ' 条回执', 'ok');
         render();
       }).catch(function (e) { toast(String(e.message || e), 'err'); rf.disabled = false; });
     });
     var ex = q('d-export');
-    if (ex) ex.addEventListener('click', function () { exportMeeting(m, S.detailResponses || []); });
+    if (ex) ex.addEventListener('click', function () {
+      MSStats.exportMeeting(m, S.detailResponses || []);
+    });
     var dl = q('d-del');
     if (dl) dl.addEventListener('click', function () {
       confirmBox('确定删除会议「' + m.title + '」？\n该会议的 ' + (S.detailResponses || []).length +
-                 ' 条回执会一并删除，且无法恢复。').then(function (ok) {
+        ' 条回执会一并删除，且无法恢复。').then(function (ok) {
         if (!ok) return;
         DB.deleteMeeting(m.id).then(function () {
           toast('会议已删除', 'ok');
@@ -661,17 +613,14 @@
         }).catch(function (e) { toast(String(e.message || e), 'err'); });
       });
     });
-
-    // 复制按钮（会议链接、催办文本）
     bindCopyButtons();
 
-    // 用缓存先渲染，再向云端拉一次最新的
     loadDetailResponses(id, true);
-    if (window.__detailTimer) clearInterval(window.__detailTimer);
+    if (root.__detailTimer) clearInterval(root.__detailTimer);
     if (S.mode === 'cloud') {
-      window.__detailTimer = setInterval(function () {
+      root.__detailTimer = setInterval(function () {
         var r = parseHash();
-        if (r.name !== 'meeting' || r.arg !== id) { clearInterval(window.__detailTimer); return; }
+        if (r.name !== 'meeting' || r.arg !== id) { clearInterval(root.__detailTimer); return; }
         loadDetailResponses(id, false);
       }, Math.max(10000, CFG.AUTO_REFRESH_MS || 30000));
     }
@@ -679,12 +628,11 @@
 
   function loadDetailResponses(id, first) {
     DB.listResponses(id).then(function (rs) {
-      var beforeKeys = (S.detailResponses || []).map(function (r) { return r.name_key; }).sort().join(',');
-      S.detailResponses = rs || [];
-      if (S.responsesCache) S.responsesCache[id] = S.detailResponses;
-      var afterKeys = S.detailResponses.map(function (r) { return r.name_key; }).sort().join(',');
-      if (afterKeys !== beforeKeys) {
-        if (!first) toast('收到新回执，已更新（共 ' + S.detailResponses.length + ' 条）', 'ok');
+      var before = (S.detailResponses || []).map(function (x) { return x.name_key; }).sort().join(',');
+      setMeetingResponses(id, rs || []);
+      var after = S.detailResponses.map(function (x) { return x.name_key; }).sort().join(',');
+      if (after !== before) {
+        if (!first) toast('收到新回执，已更新', 'ok');
         render();
       }
     }).catch(function (e) {
@@ -695,82 +643,6 @@
   /* ============================================================
    *  发布 / 编辑会议
    * ============================================================ */
-  function viewForm(editId) {
-    var isEdit = !!editId;
-    var m = isEdit ? S.meetings.filter(function (x) { return x.id === editId; })[0] : null;
-    if (isEdit && !m) return shell('meetings', '编辑会议', '', '<div class="notice err">找不到该会议</div>');
-
-    var draft = m || {
-      title: '', meet_date: U.todayISO(), start_time: '09:00', end_time: '11:00',
-      location: '', convene_dept: '', host: '', contact: '', agenda: '',
-      ask_reason: true, ask_note: true, deadline: '', invite: []
-    };
-    S.editing = draft;
-
-    // 勾选状态：编辑时按现有参会人回填
-    S.selectedInvite = {};
-    (draft.invite || []).forEach(function (p) { S.selectedInvite[inviteKey(p)] = true; });
-
-    var cats = availableCategories();
-    var catAll = cats.map(function (c) {
-      var total = rosterByCat(c).length;
-      return '<label class="cat-chip" data-cat="' + h(c) + '">' +
-             '<input type="checkbox" data-catbox="' + h(c) + '"> ' + h(c) +
-             ' <span class="mini">(' + total + ')</span></label>';
-    }).join('');
-
-    var body =
-      '<div class="btn-row" style="margin-bottom:14px">' +
-        '<button class="btn ghost sm" data-go="#/meetings">← 返回看板</button>' +
-      '</div>' +
-      '<div class="card" style="margin-bottom:14px"><div class="card-h"><h2>' +
-        (isEdit ? '编辑会议' : '发布新会议') + '</h2></div><div class="card-b">' +
-        '<label class="f"><span class="lb">会议名称 <span class="req">*</span></span>' +
-          '<input class="input" id="f-title" value="' + h(draft.title) + '" placeholder="如：2026年春季学期中层干部会议"></label>' +
-        '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">' +
-          '<label class="f"><span class="lb">会议日期</span><input type="date" class="input" id="f-date" value="' + h(draft.meet_date || '') + '"></label>' +
-          '<label class="f"><span class="lb">开始时间</span><input type="time" class="input" id="f-start" value="' + h(draft.start_time || '') + '"></label>' +
-          '<label class="f"><span class="lb">结束时间</span><input type="time" class="input" id="f-end" value="' + h(draft.end_time || '') + '"></label>' +
-          '<label class="f"><span class="lb">会议地点</span><input class="input" id="f-loc" value="' + h(draft.location) + '" placeholder="如：行政楼三楼会议室"></label>' +
-          '<label class="f"><span class="lb">主办 / 召集部门</span><input class="input" id="f-dept" value="' + h(draft.convene_dept) + '" placeholder="如：党委工作部"></label>' +
-          '<label class="f"><span class="lb">主持人</span><input class="input" id="f-host" value="' + h(draft.host) + '"></label>' +
-          '<label class="f"><span class="lb">联系人及电话</span><input class="input" id="f-contact" value="' + h(draft.contact) + '" placeholder="如：郭老师 13800000000"></label>' +
-          '<label class="f"><span class="lb">填报截止时间</span><input type="datetime-local" class="input" id="f-deadline" value="' + h(U.toLocalInput(draft.deadline)) + '">' +
-            '<span class="hint">留空表示不限制</span></label>' +
-        '</div>' +
-        '<label class="f"><span class="lb">会议议程 / 说明</span>' +
-          '<textarea class="input" id="f-agenda" placeholder="可直接粘贴会议议程、参会要求、注意事项等">' + h(draft.agenda) + '</textarea></label>' +
-        '<label class="f" style="display:flex;gap:22px;flex-wrap:wrap">' +
-          '<span><input type="checkbox" id="f-ask-reason" ' + (draft.ask_reason !== false ? 'checked' : '') + '> 二级网页收集「不参会原因」</span>' +
-          '<span><input type="checkbox" id="f-ask-note" ' + (draft.ask_note !== false ? 'checked' : '') + '> 二级网页收集「备注」</span>' +
-        '</label>' +
-      '</div></div>' +
-
-      '<div class="card"><div class="card-h"><h2>选择参会人员</h2>' +
-        '<span class="sp" style="flex:1"></span>' +
-        '<span class="tag blue" id="f-count">已选 0 人</span>' +
-      '</div><div class="card-b">' +
-        '<div class="cat-chips" style="margin-bottom:12px" id="f-cats">' +
-          '<button class="btn ghost sm" id="f-cat-all">全选所有类别</button>' +
-          '<button class="btn ghost sm" id="f-cat-none">清空</button>' +
-          catAll +
-        '</div>' +
-        '<input class="input" id="f-psearch" placeholder="搜索姓名 / 部门，快速单独勾选" style="margin-bottom:9px">' +
-        '<div class="person-list" id="f-plist"></div>' +
-        '<div class="hint">按类别勾选是「整类加入」，也可以在上面搜索框里单独挑选人员。' +
-        '已选好的人员名单会以快照方式存进本场会议 —— 以后修改总名单不会影响这场会议。</div>' +
-      '</div></div>' +
-
-      '<div class="btn-row" style="margin-top:18px">' +
-        '<button class="btn lg" id="f-save">' + (isEdit ? '保存修改' : '发布会议并生成链接') + '</button>' +
-        '<button class="btn ghost lg" data-go="#/meetings">取消</button>' +
-      '</div>';
-
-    return shell('new', isEdit ? '编辑会议' : '发布会议', '', body);
-  }
-
-  /* 勾选键必须带「类别」：同一个人在同一部门可能有两种身份（如白建侠既是
-     数学教学部的办公室主任又是院长），必须能分别勾选，否则"全选"会少算人。 */
   function inviteKey(p) {
     return U.nameKey(p.name) + '@@' + (p.dept || '') + '@@' + (p.category || '');
   }
@@ -793,25 +665,96 @@
       .sort(function (a, b) { return (a.dept || '').localeCompare(b.dept || '', 'zh'); });
   }
 
-  /* 重绘后把光标放回原来的位置，避免搜索框输入时跳到末尾 */
   function restoreCaret(id, pos) {
     var el = q(id);
     if (!el) return;
     el.focus();
-    try { el.setSelectionRange(pos, pos); } catch (e) { /* 某些输入类型不支持 */ }
+    try { el.setSelectionRange(pos, pos); } catch (e) {}
+  }
+
+  function viewForm(editId) {
+    var isEdit = !!editId;
+    var m = isEdit ? S.meetings.filter(function (x) { return x.id === editId; })[0] : null;
+    if (isEdit && !m) return shell('meetings', '编辑会议', '', '<div class="notice err">找不到该会议</div>');
+
+    var draft = m || {
+      title: '', meet_date: U.todayISO(), start_time: '09:00', end_time: '11:00',
+      location: '', convene_dept: '', host: '', contact: '', agenda: '',
+      ask_reason: true, ask_note: true, deadline: '', invite: []
+    };
+    S.editing = draft;
+
+    S.selectedInvite = {};
+    (draft.invite || []).forEach(function (p) { S.selectedInvite[inviteKey(p)] = true; });
+
+    var cats = availableCategories();
+    var catAll = cats.map(function (c) {
+      return '<label class="cat-chip" data-cat="' + h(c) + '">' +
+             '<input type="checkbox" data-catbox="' + h(c) + '"> ' + h(c) +
+             ' <span class="mini">(' + rosterByCat(c).length + ')</span></label>';
+    }).join('');
+
+    var body =
+      '<div class="btn-row" style="margin-bottom:14px">' +
+        '<button class="btn ghost sm" data-go="#/meetings">← 返回看板</button>' +
+      '</div>' +
+      '<div class="card" style="margin-bottom:14px"><div class="card-h"><h2>' +
+        (isEdit ? '编辑会议' : '发布新会议') + '</h2></div><div class="card-b">' +
+        '<label class="f"><span class="lb">会议名称 <span class="req">*</span></span>' +
+          '<input class="input" id="f-title" value="' + h(draft.title) + '" placeholder="如：2026年春季学期中层干部会议"></label>' +
+        '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">' +
+          '<label class="f"><span class="lb">会议日期</span><input type="date" class="input" id="f-date" value="' + h(draft.meet_date || '') + '"></label>' +
+          '<label class="f"><span class="lb">开始时间</span><input type="time" class="input" id="f-start" value="' + h(draft.start_time || '') + '"></label>' +
+          '<label class="f"><span class="lb">结束时间</span><input type="time" class="input" id="f-end" value="' + h(draft.end_time || '') + '"></label>' +
+          '<label class="f"><span class="lb">会议地点</span><input class="input" id="f-loc" value="' + h(draft.location) + '" placeholder="如：行政楼三楼会议室"></label>' +
+          '<label class="f"><span class="lb">主办 / 召集部门</span><input class="input" id="f-dept" value="' + h(draft.convene_dept) + '"></label>' +
+          '<label class="f"><span class="lb">主持人</span><input class="input" id="f-host" value="' + h(draft.host) + '"></label>' +
+          '<label class="f"><span class="lb">联系人及电话</span><input class="input" id="f-contact" value="' + h(draft.contact) + '"></label>' +
+          '<label class="f"><span class="lb">填报截止时间</span><input type="datetime-local" class="input" id="f-deadline" value="' + h(U.toLocalInput(draft.deadline)) + '">' +
+            '<span class="hint">留空表示不限制</span></label>' +
+        '</div>' +
+        '<label class="f"><span class="lb">会议议程 / 说明</span>' +
+          '<textarea class="input" id="f-agenda" placeholder="可直接粘贴会议议程、参会要求等">' + h(draft.agenda) + '</textarea></label>' +
+        '<label class="f" style="display:flex;gap:22px;flex-wrap:wrap">' +
+          '<span><input type="checkbox" id="f-ask-reason" ' + (draft.ask_reason !== false ? 'checked' : '') + '> 二级网页收集「不参会原因」</span>' +
+          '<span><input type="checkbox" id="f-ask-note" ' + (draft.ask_note !== false ? 'checked' : '') + '> 二级网页收集「备注」</span>' +
+        '</label>' +
+      '</div></div>' +
+
+      '<div class="card"><div class="card-h"><h2>选择参会人员</h2>' +
+        '<span class="sp" style="flex:1"></span>' +
+        '<span class="tag blue" id="f-count">已选 0 人</span>' +
+      '</div><div class="card-b">' +
+        '<div class="cat-chips" style="margin-bottom:12px" id="f-cats">' +
+          '<button class="btn ghost sm" id="f-cat-all">全选所有类别</button>' +
+          '<button class="btn ghost sm" id="f-cat-none">清空</button>' + catAll +
+        '</div>' +
+        '<input class="input" id="f-psearch" placeholder="搜索姓名 / 工号 / 部门，快速单独勾选" style="margin-bottom:9px">' +
+        '<div class="person-list" id="f-plist"></div>' +
+        '<div class="hint">按类别勾选是「整类加入」，也可以搜索后单独挑选。' +
+        '参会人名单会以快照方式存进本场会议，以后改名单不影响这场会议。</div>' +
+      '</div></div>' +
+
+      '<div class="btn-row" style="margin-top:18px">' +
+        '<button class="btn lg" id="f-save">' + (isEdit ? '保存修改' : '发布会议并生成链接') + '</button>' +
+        '<button class="btn ghost lg" data-go="#/meetings">取消</button>' +
+      '</div>';
+
+    return shell('new', isEdit ? '编辑会议' : '发布会议', '', body);
   }
 
   function bindForm(editId) {
     var isEdit = !!editId;
 
-    // 人员清单渲染
     function renderPeople() {
-      var kw = (q('f-psearch') && q('f-psearch').value || '').trim().toLowerCase();
+      var box = q('f-psearch');
+      var kw = (box && box.value || '').trim().toLowerCase();
       var cats = availableCategories();
       function match(p) {
         if (!kw) return true;
         return (p.name || '').toLowerCase().indexOf(kw) >= 0 ||
-               (p.dept || '').toLowerCase().indexOf(kw) >= 0;
+               (p.dept || '').toLowerCase().indexOf(kw) >= 0 ||
+               (String(p.emp_no || '')).toLowerCase().indexOf(kw) >= 0;
       }
       function personRow(p) {
         var k = inviteKey(p);
@@ -819,6 +762,7 @@
         return '<label class="p ' + (on ? 'on' : '') + '" data-pk="' + h(k) + '">' +
           '<input type="checkbox" ' + (on ? 'checked' : '') + ' data-pbox="' + h(k) + '">' +
           '<span class="nm">' + h(p.name) + '</span>' +
+          '<span class="mini" style="min-width:64px">' + h(p.emp_no || '—') + '</span>' +
           '<span class="dp">' + h(p.dept || '（部门未填）') + '</span>' +
         '</label>';
       }
@@ -829,7 +773,6 @@
           list.map(personRow).join('');
       }).join('');
 
-      // 没填类别（或类别为空）的人也要能被选中，否则他们会从列表里"消失"
       var other = S.roster.filter(function (p) {
         return p.active !== false && (!p.category || cats.indexOf(p.category) < 0);
       }).filter(match);
@@ -839,19 +782,18 @@
       }
       q('f-plist').innerHTML = html || '<div class="empty">名单是空的，请先到「名单管理」导入人员</div>';
 
-      // 更新类别 chip 的全选态（用遍历而不是拼选择器，避免类别名里的特殊字符破坏选择器）
       var catBoxes = document.querySelectorAll('[data-catbox]');
-      availableCategories().forEach(function (cat) {
+      cats.forEach(function (cat) {
         var all = rosterByCat(cat);
-        var box = null;
+        var cb = null;
         for (var i = 0; i < catBoxes.length; i++) {
-          if (catBoxes[i].getAttribute('data-catbox') === cat) { box = catBoxes[i]; break; }
+          if (catBoxes[i].getAttribute('data-catbox') === cat) { cb = catBoxes[i]; break; }
         }
-        if (!box) return;
+        if (!cb) return;
         var selN = all.filter(function (p) { return S.selectedInvite[inviteKey(p)]; }).length;
-        box.checked = all.length > 0 && selN === all.length;
-        box.indeterminate = selN > 0 && selN < all.length;
-        var chip = box.closest('.cat-chip');
+        cb.checked = all.length > 0 && selN === all.length;
+        cb.indeterminate = selN > 0 && selN < all.length;
+        var chip = cb.closest('.cat-chip');
         if (chip) chip.classList.toggle('on', selN > 0);
       });
 
@@ -859,7 +801,6 @@
       var c = q('f-count');
       if (c) c.textContent = '已选 ' + n + ' 人';
     }
-    window.__renderPeople = renderPeople;
 
     q('f-plist').addEventListener('change', function (e) {
       var box = e.target.closest('[data-pbox]');
@@ -872,7 +813,6 @@
       renderPeople();
       restoreCaret('f-psearch', pos);
     });
-
     q('f-cats').addEventListener('change', function (e) {
       var box = e.target.closest('[data-catbox]');
       if (!box) return;
@@ -888,13 +828,10 @@
       S.selectedInvite = {};
       renderPeople();
     });
-
     q('f-save').addEventListener('click', function () { saveMeeting(isEdit, editId); });
     renderPeople();
   }
 
-  /* 把表单里的值先收集成一个快照：这样即使随后用户又点了别处（当前页面被换掉），
-     确认框点"确定"之后仍然能拿到正确的数据，不会因为查不到 DOM 而报错。 */
   function collectForm() {
     return {
       title: (q('f-title') && q('f-title').value || '').trim(),
@@ -919,12 +856,11 @@
     var invite = S.roster.filter(function (p) {
       return p.active !== false && S.selectedInvite[inviteKey(p)];
     }).map(function (p) {
-      return { name: p.name, dept: p.dept || '', category: p.category || '', rid: p.id };
+      return { name: p.name, emp_no: p.emp_no || '', dept: p.dept || '', category: p.category || '', rid: p.id };
     });
     if (!invite.length) { toast('请至少选择 1 名参会人员', 'warn'); return; }
     data.invite = invite;
 
-    // 编辑时提醒：原来选中、但已经从名单里被删掉的人会一并移除
     var lost = [];
     if (isEdit) {
       var old = S.meetings.filter(function (x) { return x.id === editId; })[0];
@@ -936,10 +872,8 @@
     }
     if (lost.length) {
       confirmBox('有 ' + lost.length + ' 位原来的参会人已不在当前名单中，保存后会被移出本场会议：\n\n' +
-                 lost.slice(0, 12).join('、') + (lost.length > 12 ? ' 等' : '') +
-                 '\n\n确定继续保存？').then(function (ok) {
-        if (ok) doSave(isEdit, editId, data);
-      });
+        lost.slice(0, 12).join('、') + (lost.length > 12 ? ' 等' : '') + '\n\n确定继续保存？')
+        .then(function (ok) { if (ok) doSave(isEdit, editId, data); });
       return;
     }
     doSave(isEdit, editId, data);
@@ -948,7 +882,6 @@
   function doSave(isEdit, editId, payload) {
     var btn = q('f-save');
     if (btn) { btn.disabled = true; btn.textContent = '正在保存…'; }
-
     var p = isEdit ? DB.updateMeeting(editId, payload) : DB.createMeeting(payload);
     p.then(function (row) {
       var saved = row && row.id ? row : Object.assign({}, payload, { id: editId });
@@ -975,7 +908,8 @@
       if (f.kw) {
         var k = f.kw.toLowerCase();
         if ((p.name || '').toLowerCase().indexOf(k) < 0 &&
-            (p.dept || '').toLowerCase().indexOf(k) < 0) return false;
+            (p.dept || '').toLowerCase().indexOf(k) < 0 &&
+            (String(p.emp_no || '')).toLowerCase().indexOf(k) < 0) return false;
       }
       return true;
     });
@@ -988,22 +922,17 @@
       return '<tr>' +
         '<td class="ctr"><input type="checkbox" data-rsel="' + h(p.id) + '" ' + (on ? 'checked' : '') + '></td>' +
         '<td class="ctr mini">' + (i + 1) + '</td>' +
+        '<td><input class="input" style="padding:4px 7px;font-size:13px;min-width:82px" data-rf="emp_no" data-rid="' + h(p.id) + '" value="' + h(p.emp_no || '') + '" placeholder="工号"></td>' +
+        '<td><input class="input" style="padding:4px 7px;font-size:13px;font-weight:600;min-width:82px" data-rf="name" data-rid="' + h(p.id) + '" value="' + h(p.name) + '"></td>' +
+        '<td>' + catSelect(p, cats) + '</td>' +
         '<td><input class="input" style="padding:4px 7px;font-size:13px" data-rf="dept" data-rid="' + h(p.id) + '" value="' + h(p.dept) + '"></td>' +
-        '<td><select class="input" style="padding:4px 7px;font-size:13px" data-rf="category" data-rid="' + h(p.id) + '">' +
-          cats.map(function (c) {
-            return '<option value="' + h(c) + '"' + (c === p.category ? ' selected' : '') + '>' + h(c) + '</option>';
-          }).join('') +
-          (cats.indexOf(p.category) < 0 && p.category ? '<option value="' + h(p.category) + '" selected>' + h(p.category) + '</option>' : '') +
-        '</select></td>' +
-        '<td><input class="input" style="padding:4px 7px;font-size:13px;font-weight:600" data-rf="name" data-rid="' + h(p.id) + '" value="' + h(p.name) + '"></td>' +
-        '<td><input class="input" style="padding:4px 7px;font-size:13px" data-rf="phone" data-rid="' + h(p.id) + '" value="' + h(p.phone || '') + '"></td>' +
+        '<td><input class="input" style="padding:4px 7px;font-size:13px;min-width:100px" data-rf="phone" data-rid="' + h(p.id) + '" value="' + h(p.phone || '') + '"></td>' +
         '<td><input class="input" style="padding:4px 7px;font-size:13px" data-rf="note" data-rid="' + h(p.id) + '" value="' + h(p.note || '') + '"></td>' +
         '<td class="ctr"><button class="btn ghost sm" data-rdel="' + h(p.id) + '">删除</button></td>' +
       '</tr>';
     }).join('');
 
     var body =
-      (S.mode === 'local' ? '<div class="notice warn">' + localNotice() + '</div>' : '') +
       '<div class="card" style="margin-bottom:14px"><div class="card-h">' +
         '<h2>人员名单（' + S.roster.length + ' 人）</h2>' +
         '<div class="sp" style="flex:1"></div>' +
@@ -1015,7 +944,7 @@
         '<input type="file" id="r-file" accept=".xlsx,.csv" style="display:none">' +
       '</div>' +
       '<div class="card-b" style="border-bottom:1px solid var(--line);display:flex;gap:10px;flex-wrap:wrap;align-items:center">' +
-        '<input class="input" id="r-kw" style="width:230px" placeholder="搜索姓名 / 部门" value="' + h(f.kw) + '">' +
+        '<input class="input" id="r-kw" style="width:230px" placeholder="搜索姓名 / 工号 / 部门" value="' + h(f.kw) + '">' +
         '<select class="input" id="r-cat" style="width:170px"><option value="">全部类别</option>' +
           cats.map(function (c) {
             return '<option value="' + h(c) + '"' + (f.cat === c ? ' selected' : '') + '>' + h(c) + '</option>';
@@ -1025,12 +954,22 @@
         (selectedN ? '<button class="btn danger sm" id="r-del-sel">删除选中 ' + selectedN + ' 人</button>' : '') +
       '</div>' +
       '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
-        '<th style="width:34px"></th><th>#</th><th>部门</th><th>类别</th><th>姓名</th><th>手机号</th><th>备注</th><th></th>' +
+        '<th style="width:34px"></th><th>#</th><th>工号</th><th>姓名</th><th>类别</th><th>部门</th><th>手机号</th><th>备注</th><th></th>' +
       '</tr></thead><tbody>' +
-        (rows || '<tr><td colspan="8"><div class="empty"><span class="big">👥</span>名单是空的，点右上角「从 Excel 导入」或「写入初始 55 人名单」</div></td></tr>') +
+        (rows || '<tr><td colspan="9"><div class="empty"><span class="big">👥</span>名单是空的，点右上角「从 Excel 导入」或「写入初始 55 人名单」</div></td></tr>') +
       '</tbody></table></div></div>';
 
     return shell('roster', '名单管理', '', body);
+  }
+
+  function catSelect(p, cats) {
+    var opts = cats.map(function (c) {
+      return '<option value="' + h(c) + '"' + (c === p.category ? ' selected' : '') + '>' + h(c) + '</option>';
+    }).join('');
+    if (cats.indexOf(p.category) < 0 && p.category) {
+      opts = '<option value="' + h(p.category) + '" selected>' + h(p.category) + '</option>' + opts;
+    }
+    return '<select class="input" style="padding:4px 7px;font-size:13px;min-width:110px" data-rf="category" data-rid="' + h(p.id) + '">' + opts + '</select>';
   }
 
   function afterRoster() {
@@ -1051,7 +990,6 @@
       });
     });
 
-    // 单元格编辑（失焦保存）
     document.querySelectorAll('[data-rf]').forEach(function (inp) {
       var old = inp.value;
       inp.addEventListener('blur', function () {
@@ -1100,28 +1038,21 @@
 
     var add = q('r-add');
     if (add) add.addEventListener('click', function () {
-      var cats = availableCategories();
-      // 默认姓名要唯一，否则连点两次会因为「部门+类别+姓名」相同而互相覆盖
-      var used = {};
-      S.roster.forEach(function (p) { used[p.name] = 1; });
-      var nm = '新人员', i = 2;
-      while (used[nm]) { nm = '新人员' + i; i++; }
       var maxSort = S.roster.reduce(function (m, p) { return Math.max(m, p.sort_no || 0); }, 0);
       DB.insertRoster([{
-        dept: '', category: cats[0] || '处长', name: nm,
-        phone: '', note: '', sort_no: maxSort + 1
-      }]).then(function () {
-        return refreshAll();
-      }).then(function () { toast('已新增，请在表格里修改信息', 'ok'); render(); })
+        emp_no: '', dept: '', category: availableCategories()[0] || '处长',
+        name: '新人员', phone: '', note: '', sort_no: maxSort + 1
+      }]).then(function () { return refreshAll(); })
+        .then(function () { toast('已新增，请在表格里修改信息', 'ok'); render(); })
         .catch(function (e) { toast(String(e.message || e), 'err'); });
     });
 
     var seed = q('r-seed');
     if (seed) seed.addEventListener('click', function () {
-      var rows = (window.SEED_ROSTER || []).slice();
+      var rows = (root.SEED_ROSTER || []).slice();
       if (!rows.length) { toast('初始名单数据缺失（config/seed.js）', 'err'); return; }
-      confirmBox('将把初始 ' + rows.length + ' 人写入名单。\n' +
-                 '同名同部门的人会自动更新，不会重复。继续？').then(function (ok) {
+      confirmBox('将把初始 ' + rows.length + ' 人写入你的名单。\n' +
+        '按「部门+类别+姓名」合并，重复不会新增。继续？').then(function (ok) {
         if (!ok) return;
         seed.disabled = true; seed.textContent = '正在写入…';
         DB.insertRoster(rows).then(function () { return refreshAll(); })
@@ -1137,7 +1068,6 @@
       if (!f) return;
       importRosterFile(f).then(function (rows) {
         if (!rows.length) { toast('没有解析到有效数据', 'warn'); return; }
-        // 同一个「部门+类别+姓名」在同一批里只能出现一次，否则数据库会因唯一键冲突而整批失败
         var seen = {}, uniq = [];
         rows.forEach(function (r) {
           var k = (r.dept || '') + '@@' + (r.category || '') + '@@' + r.name;
@@ -1147,15 +1077,10 @@
         var skipped = rows.length - uniq.length;
         return confirmBox('解析到 ' + uniq.length + ' 条人员记录' +
           (skipped ? '（另有 ' + skipped + ' 条重复已自动合并）' : '') + '。\n' +
-          '导入后按「部门+类别+姓名」与现有名单合并：相同则更新，不同则新增。继续？')
-          .then(function (ok) {
+          '按「部门+类别+姓名」合并：相同则更新，不同则新增。继续？').then(function (ok) {
             if (!ok) return null;
-            return DB.insertRoster(uniq).then(function () {
-              return refreshAll();
-            }).then(function () {
-              toast('已导入 ' + uniq.length + ' 条', 'ok');
-              render();
-            });
+            return DB.insertRoster(uniq).then(function () { return refreshAll(); })
+              .then(function () { toast('已导入 ' + uniq.length + ' 条', 'ok'); render(); });
           });
       }).catch(function (e) {
         toast('导入失败：' + String(e.message || e), 'err');
@@ -1166,17 +1091,9 @@
     if (tpl) tpl.addEventListener('click', downloadRosterTemplate);
 
     var rex = q('r-export');
-    if (rex) rex.addEventListener('click', function () {
-      var bytes = X.buildXlsx([{
-        name: '人员名单', rows: P.rosterSheetRows(S.roster), colWidths: [7, 30, 14, 12, 16, 24]
-      }]);
-      U.download('人员名单_' + U.todayISO() + '.xlsx',
-        new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
-      toast('名单已导出', 'ok');
-    });
+    if (rex) rex.addEventListener('click', function () { MSStats.exportRoster(); });
   }
 
-  /* ================= 名单文件导入解析 ================= */
   function importRosterFile(file) {
     var name = (file.name || '').toLowerCase();
     if (/\.csv$/.test(name)) {
@@ -1186,146 +1103,26 @@
       return file.arrayBuffer().then(function (buf) { return X.readXlsx(buf); })
         .then(function (grid) { return P.rowsToRoster(grid); });
     }
-    return Promise.reject(new Error('只支持 .xlsx 或 .csv 文件。若你的表是老式 .xls，请在 Excel 里另存为 .xlsx'));
+    return Promise.reject(new Error('只支持 .xlsx 或 .csv。若是老式 .xls，请在 Excel 里另存为 .xlsx'));
   }
 
   function downloadRosterTemplate() {
     var rows = [
-      ['序号', '部门', '类别', '姓名', '手机号', '备注'],
-      [1, '机械与动力工程学院', '办公室主任', '马超', '', ''],
-      [2, '党委工作部、校长办公室', '处长', '王悦', '', ''],
-      [3, '法学院', '院长', '于语和', '', ''],
-      [4, '体育学院', '党总支书记', '周祥成', '', '']
+      ['序号', '部门', '类别', '工号', '姓名', '手机号', '备注'],
+      [1, '机械与动力工程学院', '办公室主任', '1001', '马超', '', ''],
+      [2, '党委工作部、校长办公室', '处长', '1002', '王悦', '', ''],
+      [3, '法学院', '院长', '1003', '于语和', '', ''],
+      [4, '体育学院', '党总支书记', '1004', '周祥成', '', '']
     ];
-    var bytes = X.buildXlsx([{ name: '人员名单', rows: rows, colWidths: [7, 30, 14, 12, 16, 24] }]);
-    U.download('人员名单导入模板.xlsx',
-      new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
-    toast('模板已下载，按这个格式填好后再导入', 'ok');
+    var bytes = X.buildXlsx([{ name: '人员名单', rows: rows, colWidths: [7, 30, 14, 12, 12, 16, 24] }]);
+    U.download('人员名单导入模板.xlsx', new Blob([bytes], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    }));
+    toast('模板已下载（工号在姓名前一列）', 'ok');
   }
 
   /* ============================================================
-   *  导出统计
-   * ============================================================ */
-  function viewExport() {
-    var rows = S.meetings.slice().sort(function (a, b) {
-      return (b.meet_date || '') < (a.meet_date || '') ? -1 : 1;
-    }).map(function (m) {
-      return '<tr>' +
-        '<td class="ctr"><input type="checkbox" data-xsel="' + h(m.id) + '" ' + (S.exportSel && S.exportSel[m.id] ? 'checked' : '') + '></td>' +
-        '<td class="name">' + h(m.title) + '</td>' +
-        '<td>' + h(U.fmtDate(m.meet_date) || '—') + '</td>' +
-        '<td>' + h(m.location || '—') + '</td>' +
-        '<td class="ctr">' + (m.invite || []).length + '</td>' +
-        '<td class="ctr"><button class="btn ghost sm" data-xone="' + h(m.id) + '">导出本场</button></td>' +
-      '</tr>';
-    }).join('');
-
-    var body =
-      '<div class="card" style="margin-bottom:14px"><div class="card-h"><h2>导出会议信息与统计</h2></div>' +
-      '<div class="card-b">' +
-        '<div class="btn-row">' +
-          '<button class="btn" id="x-all">导出全部会议（Excel，每场一个工作表）</button>' +
-          '<button class="btn ghost" id="x-summary">导出总览统计表</button>' +
-          '<button class="btn ghost" id="x-roster">导出人员名单</button>' +
-        '</div>' +
-        '<div class="hint" style="margin-top:10px">导出的表里包含：会议信息、受邀人、是否参会、不参会原因、备注、回执时间，' +
-        '可以直接用于归档和统计。下方的勾选框只作为标记，方便你核对自己想导哪几场，' +
-        '单独导一场请点右侧「导出本场」。</div>' +
-      '</div></div>' +
-      '<div class="card"><div class="card-h"><h2>按会议单独导出</h2></div>' +
-      '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
-        '<th style="width:34px"></th><th>会议名称</th><th>日期</th><th>地点</th><th>受邀</th><th></th>' +
-      '</tr></thead><tbody>' +
-        (rows || '<tr><td colspan="6"><div class="empty">还没有会议</div></td></tr>') +
-      '</tbody></table></div></div>';
-
-    return shell('export', '导出统计', '', body);
-  }
-
-  function afterExport() {
-    S.exportSel = S.exportSel || {};
-    document.querySelectorAll('[data-xsel]').forEach(function (b) {
-      b.addEventListener('change', function () {
-        S.exportSel[b.getAttribute('data-xsel')] = b.checked;
-      });
-    });
-    document.querySelectorAll('[data-xone]').forEach(function (b) {
-      b.addEventListener('click', function () {
-        var m = S.meetings.filter(function (x) { return x.id === b.getAttribute('data-xone'); })[0];
-        if (!m) return;
-        DB.listResponses(m.id).then(function (rs) { exportMeeting(m, rs || []); })
-          .catch(function (e) { toast(String(e.message || e), 'err'); });
-      });
-    });
-
-    q('x-all').addEventListener('click', function () {
-      var sel = S.meetings.slice();
-      if (!sel.length) { toast('没有可导出的会议', 'warn'); return; }
-      var btn = q('x-all'); btn.disabled = true; btn.textContent = '正在汇总…';
-      Promise.all(sel.map(function (m) {
-        return DB.listResponses(m.id).then(function (rs) { return { m: m, rs: rs || [] }; });
-      })).then(function (pairs) {
-        var sheets = [{
-          name: '总览', rows: P.summarySheetRows(pairs),
-          colWidths: [6, 30, 14, 14, 22, 20, 10, 10, 12, 10, 9]
-        }];
-        pairs.forEach(function (p) {
-          sheets.push({
-            name: P.sheetName(p.m.title, p.m.meet_date),
-            rows: P.meetingSheetRows(p.m, p.rs),
-            colWidths: [8, 14, 14, 26, 11, 26, 22, 18]
-          });
-        });
-        var bytes = X.buildXlsx(sheets);
-        U.download('会议统计汇总_' + U.todayISO() + '.xlsx',
-          new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
-        toast('已导出 ' + pairs.length + ' 场会议', 'ok');
-      }).catch(function (e) { toast('导出失败：' + String(e.message || e), 'err'); })
-        .then(function () { btn.disabled = false; btn.textContent = '导出全部会议（Excel，每场一个工作表）'; });
-    });
-
-    q('x-summary').addEventListener('click', function () {
-      var btn = q('x-summary'); btn.disabled = true;
-      Promise.all(S.meetings.map(function (m) {
-        return DB.listResponses(m.id).then(function (rs) { return { m: m, rs: rs || [] }; });
-      })).then(function (pairs) {
-        var bytes = X.buildXlsx([{
-          name: '总览', rows: P.summarySheetRows(pairs),
-          colWidths: [6, 30, 14, 14, 22, 20, 10, 10, 12, 10, 9]
-        }]);
-        U.download('会议总览统计_' + U.todayISO() + '.xlsx',
-          new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
-        toast('总览统计已导出', 'ok');
-      }).catch(function (e) { toast('导出失败：' + String(e.message || e), 'err'); })
-        .then(function () { btn.disabled = false; });
-    });
-
-    q('x-roster').addEventListener('click', function () {
-      var bytes = X.buildXlsx([{
-        name: '人员名单', rows: P.rosterSheetRows(S.roster),
-        colWidths: [7, 30, 14, 12, 16, 24]
-      }]);
-      U.download('人员名单_' + U.todayISO() + '.xlsx',
-        new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
-      toast('名单已导出', 'ok');
-    });
-  }
-
-  function exportMeeting(m, responses) {
-    try {
-      var bytes = X.buildXlsx([{
-        name: P.sheetName(m.title, m.meet_date),
-        rows: P.meetingSheetRows(m, responses),
-        colWidths: [8, 14, 14, 26, 11, 26, 22, 18]
-      }]);
-      U.download(U.safeFileName('参会情况_' + (m.title || '会议') + '_' + (m.meet_date || '')) + '.xlsx',
-        new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
-      toast('已导出本场会议', 'ok');
-    } catch (e) { toast('导出失败：' + e.message, 'err'); }
-  }
-
-  /* ============================================================
-   *  二级网页（参会人填写）
+   *  二级网页（参会人填报）
    * ============================================================ */
   function viewShare(token) {
     return '<div class="share-page"><div class="share-wrap" id="share-root">' +
@@ -1336,23 +1133,19 @@
   }
 
   function afterShare(token) {
-    var root = q('share-root');
-    if (!root) return;
-    window.__shareState = null;
-
+    var box = q('share-root');
+    if (!box) return;
+    root.__shareState = null;
     DB.openMeeting(token).then(function (res) {
-      if (!res || !res.ok) {
-        root.innerHTML = errorCard(res && res.error || '链接无效');
-        return;
-      }
-      window.__shareState = { token: token, data: res };
+      if (!res || !res.ok) { box.innerHTML = shareError(res && res.error || '链接无效'); return; }
+      root.__shareState = { token: token, data: res };
       renderShareForm();
     }).catch(function (e) {
-      root.innerHTML = errorCard('加载失败：' + String(e.message || e));
+      box.innerHTML = shareError('加载失败：' + String(e.message || e));
     });
   }
 
-  function errorCard(msg) {
+  function shareError(msg) {
     return '<div class="share-head"><div class="org">' + h(CFG.ORG_NAME || '') + '</div>' +
       '<h1>会议参会确认</h1></div>' +
       '<div class="share-card"><div class="bd">' +
@@ -1376,17 +1169,19 @@
   }
 
   function renderShareForm() {
-    var st = window.__shareState;
+    var st = root.__shareState;
     if (!st) return;
-    var root = q('share-root');
+    var box = q('share-root');
     var m = st.data.meeting;
     var names = st.data.names || [];
 
-    root.innerHTML =
+    box.innerHTML =
       '<div class="share-head"><div class="org">' + h(CFG.ORG_NAME || '') + '</div>' +
       '<h1>' + h(m.title) + '</h1></div>' +
 
       '<div class="share-card"><div class="hd">📋 会议信息</div>' + meetingInfoHtml(m) +
+      (m.organizer ? '<div class="bd" style="border-top:1px solid var(--line);padding-top:10px">' +
+        '<span class="hint">发布人：' + h(m.organizer) + '</span></div>' : '') +
       (m.agenda ? '<div class="bd" style="border-top:1px solid var(--line)">' +
         '<div class="k" style="font-size:12px;color:#94a3b8;font-weight:600">议程 / 说明</div>' +
         '<div style="white-space:pre-wrap;margin-top:4px">' + h(m.agenda) + '</div></div>' : '') +
@@ -1413,7 +1208,7 @@
               '<textarea class="input" id="s-reason" placeholder="如：出差、上课、身体原因等"></textarea></label></div>' +
 
             (m.ask_note ? '<label class="f" style="margin-top:14px"><span class="lb">备注（选填）</span>' +
-              '<textarea class="input" id="s-note" placeholder="如需代请假、需要准备材料等，可写在这里"></textarea></label>' : '') +
+              '<textarea class="input" id="s-note" placeholder="如需代请假、需要准备材料等"></textarea></label>' : '') +
 
             '<div id="s-msg"></div>' +
             '<button class="btn lg" id="s-submit" style="width:100%;margin-top:6px">提交确认</button>' +
@@ -1435,8 +1230,7 @@
       document.querySelectorAll('[data-pick]').forEach(function (el) {
         el.classList.toggle('on', el.getAttribute('data-pick') === picked);
       });
-      var showReason = (picked === 'no') && m.ask_reason !== false;
-      reasonWrap.style.display = showReason ? 'block' : 'none';
+      reasonWrap.style.display = ((picked === 'no') && m.ask_reason !== false) ? 'block' : 'none';
     }
 
     document.querySelectorAll('[data-pick]').forEach(function (el) {
@@ -1447,7 +1241,6 @@
       });
     });
 
-    // 姓名输完自动带出上次的答复
     var lastQuery = '';
     nameInput.addEventListener('change', function () {
       var v = nameInput.value.trim();
@@ -1459,10 +1252,10 @@
         paintPick();
         if (r.reason && q('s-reason')) q('s-reason').value = r.reason;
         if (r.note && q('s-note')) q('s-note').value = r.note;
-        msg.innerHTML = '<div class="notice info" style="margin:0 0 12px">' +
-          '您上次填写的是「' + (r.attending ? '参加' : '不参加') + '」（' +
-          h(U.fmtDateTime(r.updated_at)) + '），可以直接修改后重新提交。</div>';
-      }).catch(function () { /* 静默 */ });
+        msg.innerHTML = '<div class="notice info" style="margin:0 0 12px">您上次填写的是「' +
+          (r.attending ? '参加' : '不参加') + '」（' + h(U.fmtDateTime(r.updated_at)) +
+          '），可以直接修改后重新提交。</div>';
+      }).catch(function () {});
     });
 
     q('s-submit').addEventListener('click', function () {
@@ -1491,9 +1284,9 @@
   }
 
   function renderShareDone(r, m) {
-    var root = q('share-root');
+    var box = q('share-root');
     var yes = !!r.attending;
-    root.innerHTML =
+    box.innerHTML =
       '<div class="share-head"><div class="org">' + h(CFG.ORG_NAME || '') + '</div>' +
       '<h1>' + h(m.title) + '</h1></div>' +
       '<div class="share-card"><div class="bd">' +
@@ -1503,23 +1296,33 @@
           '<div class="ss">' + h(r.name) + '　' + h(U.fmtDateTime(r.updated_at)) + '</div>' +
         '</div>' +
         (r.on_list ? '' : '<div class="notice warn" style="margin:0 0 12px">' +
-          '提示：您填写的姓名不在本次受邀名单中，工作人员会人工核对。' +
-          '如果名字写错了，可以点下面的按钮改。' + '</div>') +
+          '提示：您填写的姓名不在本次受邀名单中，工作人员会人工核对。如果名字写错了，可以点下面的按钮改。</div>') +
         '<div class="notice ok" style="margin:0 0 14px">' + h(r.message || '已记录') +
           '。会议开始前如有变化，可以重新打开本链接修改。</div>' +
         '<button class="btn ghost lg" id="s-again" style="width:100%">修改我的确认</button>' +
       '</div></div>' +
       '<div class="share-card"><div class="hd">📋 会议信息</div>' + meetingInfoHtml(m) + '</div>' +
       '<div class="share-foot">' + h(CFG.APP_NAME || '') + '</div>';
-
     var again = q('s-again');
     if (again) again.addEventListener('click', function () { renderShareForm(); });
     window.scrollTo(0, 0);
   }
 
-  /* ================= 启动 ================= */
+  /* ================= 对外暴露 ================= */
+  root.MS = {
+    state: S,
+    q: q, h: h, toast: toast, shell: shell, go: go, render: render,
+    queryParams: queryParams,
+    promptBox: promptBox, confirmBox: confirmBox,
+    refreshAll: refreshAll, refreshProfile: refreshProfile, refreshAccount: refreshAccount,
+    afterLogin: afterLogin,
+    fmtDate: function (d) { return U.fmtDate(d); },
+    fmtDateWeek: function (d) { return U.fmtDateWeek(d); },
+    fmtDateTime: function (d) { return U.fmtDateTime(d); }
+  };
+
   window.addEventListener('hashchange', function () {
-    if (window.__detailTimer) { clearInterval(window.__detailTimer); window.__detailTimer = null; }
+    if (root.__detailTimer) { clearInterval(root.__detailTimer); root.__detailTimer = null; }
     render();
   });
 
@@ -1528,4 +1331,4 @@
   } else {
     boot();
   }
-})();
+})(typeof globalThis !== 'undefined' ? globalThis : this);

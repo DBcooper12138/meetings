@@ -35,26 +35,30 @@
     // 只在"表头样"的单元格里找列名：整格恰好是「姓名」这类词，或含明确后缀
     // （不能用 /姓名/ 这种宽松匹配 ——「党总支书记」里也含"书记"、"姓名"会误中）
     var HEAD_RE = {
-      name: /^(姓名|名字|人员姓名|姓名\s*$)/,
+      name: /^(姓名|名字|人员姓名)/,
+      emp: /^(工号|员工号|职工号|教工号|人员编号|编号)/,
       dept: /^(部门|单位|学院|处室|机构|部门名称|所在部门|部门\/单位)/,
       cat: /^(类别|分类|身份|职务类型|人员类别|类别名称)/,
       phone: /^(手机|手机号|电话|联系电话|联系方式)/,
       note: /^(备注|说明|备注说明)/,
-      sort: /^(序号|编号|排序)/
+      sort: /^(序号|排序)/
     };
     function find(re) {
       for (var i = 0; i < head.length; i++) if (re.test(head[i])) return i;
       return -1;
     }
     var iName = find(HEAD_RE.name);
+    var iEmp = find(HEAD_RE.emp);
     var iDept = find(HEAD_RE.dept);
     var iCat = find(HEAD_RE.cat);
     var iPhone = find(HEAD_RE.phone);
     var iNote = find(HEAD_RE.note);
     var iSort = find(HEAD_RE.sort);
 
-    var hasHeader = iName >= 0 || iDept >= 0 || iCat >= 0;
-    if (!hasHeader && grid[0].length >= 4) { iSort = 0; iDept = 1; iCat = 2; iName = 3; }
+    var hasHeader = iName >= 0 || iDept >= 0 || iCat >= 0 || iEmp >= 0;
+    // 无表头时的列序推断（v2 多了「工号」列）
+    if (!hasHeader && grid[0].length >= 5) { iSort = 0; iDept = 1; iCat = 2; iEmp = 3; iName = 4; }
+    else if (!hasHeader && grid[0].length === 4) { iSort = 0; iDept = 1; iCat = 2; iName = 3; }
     else if (!hasHeader && grid[0].length === 3) { iDept = 0; iCat = 1; iName = 2; }
     else if (!hasHeader && grid[0].length === 2) { iDept = 0; iName = 1; }
 
@@ -75,7 +79,7 @@
       var sortRaw = cell(iSort).replace(/[^\d]/g, '');
       out.push({
         sort_no: sortRaw ? parseInt(sortRaw, 10) : (out.length + 1),
-        dept: dept, category: cat, name: nm,
+        dept: dept, category: cat, emp_no: cell(iEmp), name: nm,
         phone: cell(iPhone), note: cell(iNote), active: true
       });
     }
@@ -99,7 +103,7 @@
       used[k] = 1;
       var r = map[k];
       return {
-        name: p.name, dept: p.dept || '', category: p.category || '',
+        name: p.name, emp_no: p.emp_no || '', dept: p.dept || '', category: p.category || '',
         status: r ? (r.attending ? 'yes' : 'no') : 'pending',
         reason: r ? (r.reason || '') : '', note: r ? (r.note || '') : '',
         updated_at: r ? r.updated_at : '', on_list: true
@@ -108,7 +112,7 @@
 
     var outside = responses.filter(function (r) { return !used[r.name_key]; }).map(function (r) {
       return {
-        name: r.name_raw, dept: r.dept || '', category: r.category || '',
+        name: r.name_raw, emp_no: '', dept: r.dept || '', category: r.category || '',
         status: r.attending ? 'yes' : 'no',
         reason: r.reason || '', note: r.note || '',
         updated_at: r.updated_at, on_list: false
@@ -167,10 +171,10 @@
       ['确认不参会', att.stats.no],
       ['尚未确认', att.stats.pending],
       [],
-      ['序号', '姓名', '类别', '部门', '是否参会', '不参会原因', '备注', '回执时间']
+      ['序号', '工号', '姓名', '类别', '部门', '是否参会', '不参会原因', '备注', '回执时间']
     ];
     sortRows(att.rows).forEach(function (r, i) {
-      rows.push([i + 1, r.name, r.category, r.dept, statusText(r.status),
+      rows.push([i + 1, r.emp_no || '', r.name, r.category, r.dept, statusText(r.status),
                  r.reason || '', r.note || '',
                  r.updated_at ? fmt.dateTime(r.updated_at) : '']);
     });
@@ -195,11 +199,109 @@
   }
 
   function rosterSheetRows(roster) {
-    var rows = [['序号', '部门', '类别', '姓名', '手机号', '备注']];
+    var rows = [['序号', '部门', '类别', '工号', '姓名', '手机号', '备注']];
     roster.slice().sort(function (a, b) { return (a.sort_no || 0) - (b.sort_no || 0); })
       .forEach(function (p, i) {
-        rows.push([p.sort_no || i + 1, p.dept || '', p.category || '', p.name, p.phone || '', p.note || '']);
+        rows.push([p.sort_no || i + 1, p.dept || '', p.category || '', p.emp_no || '',
+                   p.name, p.phone || '', p.note || '']);
       });
+    return rows;
+  }
+
+  /* ================= 人员维度统计 =================
+     把「所有会议 + 所有回执」摊平成"每个人 × 每场会议"的记录。
+     返回 [{ key, name, emp_no, dept, category,
+             invited: n, attended: n, declined: n, pending: n,
+             rate: 0-100, meetings: [{meeting, status, reason, note, updated_at}] }]
+  */
+  function buildPersonStats(meetings, responses) {
+    var byMeeting = Object.create(null);
+    (responses || []).forEach(function (r) {
+      (byMeeting[r.meeting_id] = byMeeting[r.meeting_id] || []).push(r);
+    });
+
+    var people = Object.create(null);
+
+    function ensure(name, extra) {
+      var k = nameKey(name);
+      if (!k) return null;
+      if (!people[k]) {
+        people[k] = {
+          key: k, name: name, emp_no: '', dept: '', category: '',
+          invited: 0, attended: 0, declined: 0, pending: 0, rate: 0, meetings: []
+        };
+      }
+      var p = people[k];
+      if (extra) {
+        if (!p.emp_no && extra.emp_no) p.emp_no = extra.emp_no;
+        if (!p.dept && extra.dept) p.dept = extra.dept;
+        if (!p.category && extra.category) p.category = extra.category;
+      }
+      return p;
+    }
+
+    (meetings || []).forEach(function (m) {
+      var att = buildAttendance(m, byMeeting[m.id] || []);
+      att.rows.forEach(function (row) {
+        var p = ensure(row.name, row);
+        if (!p) return;
+        p.invited++;
+        if (row.status === 'yes') p.attended++;
+        else if (row.status === 'no') p.declined++;
+        else p.pending++;
+        p.meetings.push({
+          meeting: m, status: row.status, reason: row.reason || '',
+          note: row.note || '', updated_at: row.updated_at || '', on_list: row.on_list
+        });
+      });
+    });
+
+    var list = Object.keys(people).map(function (k) {
+      var p = people[k];
+      var answered = p.attended + p.declined;
+      p.rate = answered ? Math.round(p.attended * 100 / answered) : 0;
+      p.meetings.sort(function (a, b) {
+        return String(b.meeting.meet_date || '') < String(a.meeting.meet_date || '') ? -1 : 1;
+      });
+      return p;
+    });
+    list.sort(function (a, b) {
+      if (b.invited !== a.invited) return b.invited - a.invited;
+      return String(a.name).localeCompare(String(b.name), 'zh');
+    });
+    return list;
+  }
+
+  /* 单人统计导出表 */
+  function personSheetRows(person) {
+    var rows = [
+      ['姓名', person.name],
+      ['工号', person.emp_no || ''],
+      ['部门', person.dept || ''],
+      ['类别', person.category || ''],
+      ['被邀请次数', person.invited],
+      ['已参会', person.attended],
+      ['已请假', person.declined],
+      ['未确认', person.pending],
+      ['出席率（占已回复）', person.rate + '%'],
+      [],
+      ['序号', '会议日期', '会议名称', '地点', '是否参会', '请假原因', '备注', '回执时间']
+    ];
+    person.meetings.forEach(function (x, i) {
+      rows.push([i + 1, fmt.date(x.meeting.meet_date) || '', x.meeting.title || '',
+                 x.meeting.location || '', statusText(x.status), x.reason || '', x.note || '',
+                 x.updated_at ? fmt.dateTime(x.updated_at) : '']);
+    });
+    return rows;
+  }
+
+  /* 全体人员统计导出表 */
+  function personSummaryRows(list) {
+    var rows = [['序号', '工号', '姓名', '部门', '类别', '被邀请次数', '已参会', '已请假', '未确认', '出席率']];
+    list.forEach(function (p, i) {
+      rows.push([i + 1, p.emp_no || '', p.name, p.dept || '', p.category || '',
+                 p.invited, p.attended, p.declined, p.pending, p.rate + '%']);
+    });
     return rows;
   }
 
@@ -216,6 +318,9 @@
     meetingSheetRows: meetingSheetRows,
     summarySheetRows: summarySheetRows,
     rosterSheetRows: rosterSheetRows,
+    buildPersonStats: buildPersonStats,
+    personSheetRows: personSheetRows,
+    personSummaryRows: personSummaryRows,
     sheetName: sheetName,
     setFormatters: setFormatters
   };
