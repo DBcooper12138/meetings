@@ -29,15 +29,19 @@
 
   function authShell(bodyHtml) {
     var cfg = root.MS_CONFIG || {};
+    var org = String(cfg.ORG_NAME || '').trim();
+    var appName = String(cfg.APP_NAME || '会议系统').trim();
+    // 单位名称留空时：不渲染那一行，页脚也不留多余的「·」
+    var footParts = [org, appName].filter(function (x) { return x; });
     return '<div class="auth-page">' +
       '<div class="auth-box">' +
         '<div class="auth-brand">' +
-          '<div class="org">' + h(cfg.ORG_NAME || '') + '</div>' +
-          '<h1>' + h(cfg.APP_NAME || '会议系统') + '</h1>' +
+          (org ? '<div class="org">' + h(org) + '</div>' : '') +
+          '<h1>' + h(appName) + '</h1>' +
         '</div>' +
         bodyHtml +
       '</div>' +
-      '<div class="auth-foot">' + h(cfg.ORG_NAME || '') + ' · ' + h(cfg.APP_NAME || '') + '</div>' +
+      '<div class="auth-foot">' + h(footParts.join(' · ')) + '</div>' +
     '</div>';
   }
 

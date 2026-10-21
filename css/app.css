@@ -298,3 +298,43 @@ table.tbl .mini{font-size:12px;color:var(--slate3)}
   #person-layout{grid-template-columns:1fr !important}
   .pl-list{max-height:40vh}
 }
+
+/* ============================================================
+ *  v2.3 会场布局（座位图）+ 签到
+ * ============================================================ */
+.ly-layout{display:grid;grid-template-columns:250px 1fr;gap:14px;align-items:start}
+@media (max-width:900px){.ly-layout{grid-template-columns:1fr}}
+
+.ly-side{background:#fff;border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.ly-side-hd{padding:11px 14px;border-bottom:1px solid var(--line);font-weight:650;font-size:14px;display:flex;gap:8px;align-items:center}
+.ly-hint{padding:8px 14px;font-size:12px;color:var(--slate3);border-bottom:1px solid var(--line);background:#f8fafc;line-height:1.5}
+.ly-people{max-height:66vh;overflow:auto}
+.ly-grp{padding:5px 14px;background:#f1f5f9;font-size:12px;font-weight:700;color:var(--slate2);position:sticky;top:0}
+.ly-p{display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid #f8fafc;cursor:pointer;font-size:13px}
+.ly-p:hover{background:#f8fafc}
+.ly-p.on{background:var(--blue-l);box-shadow:inset 3px 0 0 var(--blue)}
+.ly-p .ly-pn{font-weight:600;min-width:56px}
+.ly-p .ly-pe{font-size:11.5px;color:var(--slate3);min-width:52px}
+.ly-p .tag{margin-left:auto;font-size:11px}
+
+.ly-stage-wrap{background:#fff;border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden;min-width:0}
+.ly-toolbar{display:flex;gap:8px;align-items:center;padding:9px 12px;border-bottom:1px solid var(--line);background:#f8fafc;flex-wrap:wrap}
+.ly-viewport{overflow:auto;height:70vh;background:
+  linear-gradient(90deg,#f1f5f9 1px,transparent 1px) 0 0/24px 24px,
+  linear-gradient(#f1f5f9 1px,transparent 1px) 0 0/24px 24px,#fff;}
+.ly-canvas{position:relative;transform-origin:0 0}
+
+.ly-scene{position:absolute;border:2px dashed #cbd5e1;border-radius:10px;background:rgba(248,250,252,.6);pointer-events:none}
+.ly-scene-name{position:absolute;left:10px;top:8px;font-size:12px;color:#94a3b8;font-weight:700}
+
+.ly-seat{position:absolute;border:1px solid #dbe3ec;background:#f8fafc;border-radius:6px;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;
+  cursor:pointer;overflow:hidden;user-select:none;transition:box-shadow .12s,border-color .12s}
+.ly-seat:hover{border-color:#93c5fd;box-shadow:0 2px 8px rgba(29,78,216,.12)}
+.ly-seat.taken{background:#eef6ff;border-color:#7cb3f0;font-weight:600}
+.ly-seat.outside{background:#fff7ed;border-color:#fdba74}
+.ly-seat.sel{border-color:var(--blue);box-shadow:0 0 0 3px rgba(29,78,216,.25)}
+.ly-seat .ly-seat-name{font-size:inherit;line-height:1.15;max-width:100%;padding:0 3px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ly-seat .ly-seat-label{font-size:10px;color:#94a3b8;line-height:1}
+
+.seat-big{font-size:20px;font-weight:750;color:var(--blue-d);text-align:center;margin:6px 0}

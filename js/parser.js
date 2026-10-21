@@ -113,10 +113,14 @@
         used['n:' + nameK] = 1;
       }
       return {
-        name: p.name, emp_no: p.emp_no || '', dept: p.dept || '', category: p.category || '',
+        name: p.name,
+        // 名单里没录工号时，退而显示本人回执里填的工号（只用于展示，不改名单）
+        emp_no: p.emp_no || (r && r.emp_no) || '',
+        dept: p.dept || '', category: p.category || '',
         status: r ? (r.attending ? 'yes' : 'no') : 'pending',
         reason: r ? (r.reason || '') : '', note: r ? (r.note || '') : '',
         updated_at: r ? r.updated_at : '', on_list: true,
+        emp_from_roster: !!p.emp_no,
         response_id: r ? r.id : '', promoted: r ? !!r.promoted : false
       };
     });

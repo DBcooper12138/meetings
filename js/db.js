@@ -1,4 +1,4 @@
-/* ============================================================
+﻿/* ============================================================
  *  db.js —— 数据访问层（v2 多用户版）
  *
  *  · 首选：Supabase 云端（Auth 登录 + RLS 按用户隔离）
@@ -598,10 +598,15 @@
 
   function normalizeMeeting(m, isPatch) {
     var keys = ['title', 'meet_date', 'start_time', 'end_time', 'location', 'convene_dept',
-                'host', 'contact', 'agenda', 'ask_reason', 'ask_note', 'deadline', 'invite', 'status'];
+                'host', 'contact', 'agenda', 'ask_reason', 'ask_note', 'deadline', 'invite', 'status',
+                'layout_enabled', 'checkin_start', 'checkin_end'];
     var out = {};
     keys.forEach(function (k) {
-      if (m[k] !== undefined) out[k] = (m[k] === '' && (k === 'meet_date' || k === 'deadline')) ? null : m[k];
+      if (m[k] !== undefined) {
+        var nullable = (k === 'meet_date' || k === 'deadline' ||
+                        k === 'checkin_start' || k === 'checkin_end');
+        out[k] = (m[k] === '' && nullable) ? null : m[k];
+      }
     });
     if (!isPatch) {
       if (out.title === undefined) out.title = '未命名会议';
@@ -778,6 +783,193 @@
     }
     return client().rpc('my_response', { p_token: token, p_name: name, p_emp_no: empNo || '' })
       .then(function (r) { return unwrap(r, '读取回执'); });
+  }
+
+  /* ================= 会场布局 ================= */
+  function getLayout(meetingId) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var row = (db.layouts || {})[meetingId];
+      return Promise.resolve(row || null);
+    }
+    return client().from('meeting_layouts').select('*').eq('meeting_id', meetingId).maybeSingle()
+      .then(function (r) { return unwrap(r, '读取布局'); });
+  }
+
+  function saveLayout(meetingId, mode, layout) {
+    if (!isCloud()) {
+      var db = readLocal();
+      db.layouts = db.layouts || {};
+      db.layouts[meetingId] = { meeting_id: meetingId, mode: mode, layout: layout, updated_at: nowISO() };
+      writeLocal(db);
+      return Promise.resolve(db.layouts[meetingId]);
+    }
+    return client().from('meeting_layouts')
+      .upsert({ meeting_id: meetingId, mode: mode, layout: layout, updated_at: new Date().toISOString() },
+              { onConflict: 'meeting_id' })
+      .select().single()
+      .then(function (r) { return unwrap(r, '保存布局'); });
+  }
+
+  /* ================= 签到 ================= */
+  function personKey(empNo, name) {
+    var e = String(empNo || '').replace(/\s+/g, '').toLowerCase();
+    if (e) return 'e:' + e;
+    var n = String(name || '').replace(/\s+/g, '').toLowerCase();
+    return n ? 'n:' + n : '';
+  }
+
+  function seatOf(layout, pk) {
+    var empty = { seat_key: '', seat_label: '', scene_name: '' };
+    if (!layout || !layout.assign || !pk) return empty;
+    var key = null;
+    Object.keys(layout.assign).forEach(function (k) {
+      if (!key && layout.assign[k] === pk) key = k;
+    });
+    if (!key) return empty;
+    var s = (layout.seats || []).filter(function (x) { return x.key === key; })[0];
+    return {
+      seat_key: key,
+      seat_label: s ? (s.label || '') : '',
+      scene_name: s ? (s.sceneName || '') : ''
+    };
+  }
+
+  /* 双键查座：名单没录工号时，参会人自己填的工号也要能对上 */
+  function seatOfAny(layout, empNo, name) {
+    var byEmp = seatOf(layout, personKey(empNo, ''));
+    if (byEmp.seat_key) return byEmp;
+    return seatOf(layout, personKey('', name));
+  }
+  function checkinWindow(m) {
+    var now = Date.now();
+    var st = m.checkin_start ? new Date(m.checkin_start).getTime() : null;
+    var en = m.checkin_end ? new Date(m.checkin_end).getTime() : null;
+    return (st === null || now >= st) && (en === null || now <= en);
+  }
+
+  function listCheckins(meetingId) {
+    if (!isCloud()) {
+      var db = readLocal();
+      return Promise.resolve((db.checkins || []).filter(function (x) { return x.meeting_id === meetingId; })
+        .sort(function (a, b) { return a.checked_in_at < b.checked_in_at ? 1 : -1; }));
+    }
+    return client().from('checkins').select('*').eq('meeting_id', meetingId)
+      .order('checked_in_at', { ascending: false })
+      .then(function (r) { return unwrap(r, '读取签到') || []; });
+  }
+
+  function manualCheckin(meetingId, person) {
+    if (!isCloud()) {
+      var db = readLocal();
+      db.checkins = db.checkins || [];
+      var pk = personKey(person.emp_no, person.name);
+      var layout = (db.layouts || {})[meetingId] && db.layouts[meetingId].layout;
+      var seat = seatOfAny(layout, person.emp_no, person.name);
+      var exist = db.checkins.filter(function (x) { return x.meeting_id === meetingId && x.person_key === pk; })[0];
+      if (exist) return Promise.resolve(exist);
+      var row = {
+        id: uuid(), meeting_id: meetingId, person_key: pk,
+        emp_no: String(person.emp_no || '').toLowerCase(), name: person.name,
+        seat_key: seat.seat_key, scene_name: seat.scene_name, seat_label: seat.seat_label,
+        checked_in_at: nowISO(), source: 'manual'
+      };
+      db.checkins.push(row);
+      writeLocal(db);
+      return Promise.resolve(row);
+    }
+    var pk2 = personKey(person.emp_no, person.name);
+    return client().from('checkins').upsert({
+      meeting_id: meetingId, person_key: pk2,
+      emp_no: String(person.emp_no || '').toLowerCase(), name: person.name,
+      source: 'manual'
+    }, { onConflict: 'meeting_id,person_key' }).select().single()
+      .then(function (r) { return unwrap(r, '补签'); });
+  }
+
+  function deleteCheckin(id) {
+    if (!isCloud()) {
+      var db = readLocal();
+      db.checkins = (db.checkins || []).filter(function (x) { return x.id !== id; });
+      writeLocal(db);
+      return Promise.resolve(true);
+    }
+    return client().from('checkins').delete().eq('id', id)
+      .then(function (r) { return unwrap(r, '撤销签到'); });
+  }
+
+  function checkinInfo(token, empNo, name) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var m = (db.meetings || []).filter(function (x) { return x.share_token === token; })[0];
+      if (!m) return Promise.resolve({ ok: false, error: '链接无效' });
+      var pk = personKey(empNo, name);
+      var ci = (db.checkins || []).filter(function (x) {
+        return x.meeting_id === m.id && x.person_key === pk;
+      })[0];
+      var layout = (db.layouts || {})[m.id] && db.layouts[m.id].layout;
+      if (ci) {
+        return Promise.resolve({
+          ok: true, layout_enabled: !!m.layout_enabled, open: false, checked_in: true,
+          checked_in_at: ci.checked_in_at,
+          seat: { seat_key: ci.seat_key, seat_label: ci.seat_label, scene_name: ci.scene_name }
+        });
+      }
+      return Promise.resolve({
+        ok: true, layout_enabled: !!m.layout_enabled,
+        open: !!m.layout_enabled && checkinWindow(m),
+        checked_in: false, start: m.checkin_start, end: m.checkin_end, person_key: pk,
+        seat: seatOfAny(layout, empNo, name)
+      });
+    }
+    return client().rpc('checkin_info', {
+      p_token: token, p_emp_no: empNo || '', p_name: name || ''
+    }).then(function (r) { return unwrap(r, '读取签到状态'); });
+  }
+
+  function submitCheckin(token, empNo, name) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var m = (db.meetings || []).filter(function (x) { return x.share_token === token; })[0];
+      if (!m) return Promise.resolve({ ok: false, error: '链接无效或会议已撤销' });
+      if (!m.layout_enabled) return Promise.resolve({ ok: false, error: '这场会议没有开启签到' });
+      if (!checkinWindow(m)) return Promise.resolve({ ok: false, error: '签到未开始或已截止' });
+      if (!empNo) return Promise.resolve({ ok: false, error: '请填写你的工号' });
+      var pk = personKey(empNo, name);
+      var layout = (db.layouts || {})[m.id] && db.layouts[m.id].layout;
+      var seat = seatOfAny(layout, empNo, name);
+      db.checkins = db.checkins || [];
+      db.checkins = db.checkins.filter(function (x) { return !(x.meeting_id === m.id && x.person_key === pk); });
+      var row = {
+        id: uuid(), meeting_id: m.id, person_key: pk, emp_no: String(empNo).toLowerCase(),
+        name: name, seat_key: seat.seat_key, scene_name: seat.scene_name, seat_label: seat.seat_label,
+        checked_in_at: nowISO(), source: 'link'
+      };
+      db.checkins.push(row);
+      writeLocal(db);
+      return Promise.resolve({ ok: true, checked_in_at: row.checked_in_at, name: row.name, seat: seat });
+    }
+    return client().rpc('submit_checkin', {
+      p_token: token, p_emp_no: empNo || '', p_name: name || ''
+    }).then(function (r) { return unwrap(r, '签到'); });
+  }
+
+  function seatMap(token, empNo, name) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var m = (db.meetings || []).filter(function (x) { return x.share_token === token; })[0];
+      if (!m || !m.layout_enabled) return Promise.resolve({ ok: false, error: '这场会议没有座位图' });
+      var L = (db.layouts || {})[m.id] && db.layouts[m.id].layout;
+      if (!L) return Promise.resolve({ ok: false, error: '会议还没有排座位' });
+      var seat = seatOfAny(L, empNo, name);
+      return Promise.resolve({
+        ok: true, mode: L.mode, style: L.style, canvas: L.canvas,
+        seats: L.seats, scenes: L.scenes || [],
+        my_seat_key: seat.seat_key, my_seat_label: seat.seat_label, my_scene_name: seat.scene_name
+      });
+    }
+    return client().rpc('seat_map', { p_token: token, p_emp_no: empNo || '', p_name: name || '' })
+      .then(function (r) { return unwrap(r, '读取座位图'); });
   }
 
   /* ================= 超级管理员 ================= */
@@ -999,6 +1191,9 @@
     listMeetings: listMeetings, getMeeting: getMeeting, createMeeting: createMeeting,
     updateMeeting: updateMeeting, deleteMeeting: deleteMeeting,
     listResponses: listResponses, listAllResponses: listAllResponses, deleteResponse: deleteResponse,
+    getLayout: getLayout, saveLayout: saveLayout,
+    listCheckins: listCheckins, manualCheckin: manualCheckin, deleteCheckin: deleteCheckin,
+    checkinInfo: checkinInfo, submitCheckin: submitCheckin, seatMap: seatMap,
     openMeeting: openMeeting, submitResponse: submitResponse, myResponse: myResponse,
     admin: admin, enterDemo: enterDemo
   };

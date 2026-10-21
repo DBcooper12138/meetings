@@ -1,4 +1,4 @@
--- ============================================================
+﻿-- ============================================================
 --  会议发布与参会确认系统 —— 数据库结构 v2（多用户版）
 --  用法：Supabase 控制台 -> SQL Editor -> New query -> 整段粘贴 -> Run
 --
@@ -11,6 +11,8 @@
 -- ============================================================
 
 set search_path = public, extensions;
+-- 关闭函数体校验：脚本里函数之间互相引用时，不要求被调用的函数先定义。
+set check_function_bodies = off;
 
 -- ------------------------------------------------------------
 -- 0. 清理 v1 的"单管理员口令"方案
@@ -193,6 +195,54 @@ alter table public.responses add column if not exists emp_no text not null defau
 -- v2.2：是否已"一键加入名单"
 alter table public.responses add column if not exists promoted boolean not null default false;
 create index if not exists responses_emp_idx on public.responses (meeting_id, emp_no);
+
+-- ------------------------------------------------------------
+-- 5.1 v2.3：会场布局 + 签到
+-- ------------------------------------------------------------
+alter table public.meetings add column if not exists layout_enabled boolean not null default false;
+alter table public.meetings add column if not exists checkin_start timestamptz;
+alter table public.meetings add column if not exists checkin_end   timestamptz;
+
+-- 每场会议最多一份布局（整块 JSON，含座位与人员绑定）
+create table if not exists public.meeting_layouts (
+  meeting_id  uuid primary key references public.meetings(id) on delete cascade,
+  mode        text not null default 'grid',          -- grid(排座式) | free(自由布局)
+  layout      jsonb not null default '{}'::jsonb,    -- 座位、场景、样式、seatKey->personKey 绑定
+  updated_at  timestamptz not null default now()
+);
+
+-- 签到记录（与"参会回执"独立：回执=是否愿意来，签到=实际到场）
+create table if not exists public.checkins (
+  id            uuid primary key default gen_random_uuid(),
+  meeting_id    uuid not null references public.meetings(id) on delete cascade,
+  person_key    text not null,                      -- e:工号 或 n:姓名
+  emp_no        text not null default '',
+  name          text not null,
+  seat_key      text not null default '',
+  scene_name    text not null default '',
+  seat_label    text not null default '',
+  checked_in_at timestamptz not null default now(),
+  source        text not null default 'link',       -- link | manual
+  unique (meeting_id, person_key)
+);
+create index if not exists checkins_meeting_idx on public.checkins (meeting_id, checked_in_at desc);
+
+-- 布局写入同样受"会员"限制；签到开关也一样
+create or replace function public.check_layout_allowed()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_owner uuid;
+begin
+  select owner_id into v_owner from public.meetings where id = new.meeting_id;
+  if not public.is_super() and not (v_owner = auth.uid() and public.has_active_plan()) then
+    raise exception '会场布局是会员功能，请先购买套餐' using errcode = '42501';
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists trg_layout_quota on public.meeting_layouts;
+create trigger trg_layout_quota before insert or update on public.meeting_layouts
+  for each row execute function public.check_layout_allowed();
+
 
 -- ------------------------------------------------------------
 -- 6. 通用工具函数
@@ -1012,3 +1062,272 @@ where not exists (select 1 from public.plans);
 -- select tablename, policyname, cmd from pg_policies
 --  where schemaname = 'public' order by tablename, policyname;
 -- select public.is_emp_no_taken('随便一个工号') as 工号是否已占用;
+
+-- ============================================================
+-- 18. v2.3 会场布局 + 签到
+--     布局写入受会员限制（见 5.1 的 trg_layout_quota）；
+--     签到是"匿名可参与"的：凭 share_token，不需要登录。
+-- ============================================================
+
+-- 18.1 安全策略
+alter table public.meeting_layouts enable row level security;
+alter table public.checkins         enable row level security;
+
+drop policy if exists layout_owner_all on public.meeting_layouts;
+drop policy if exists checkin_owner_all on public.checkins;
+
+create policy layout_owner_all on public.meeting_layouts
+  for all to authenticated
+  using (exists (select 1 from public.meetings m
+                  where m.id = meeting_layouts.meeting_id
+                    and (m.owner_id = auth.uid() or public.is_super())))
+  with check (exists (select 1 from public.meetings m
+                  where m.id = meeting_layouts.meeting_id
+                    and (m.owner_id = auth.uid() or public.is_super())));
+
+create policy checkin_owner_all on public.checkins
+  for all to authenticated
+  using (exists (select 1 from public.meetings m
+                  where m.id = checkins.meeting_id
+                    and (m.owner_id = auth.uid() or public.is_super())))
+  with check (exists (select 1 from public.meetings m
+                  where m.id = checkins.meeting_id
+                    and (m.owner_id = auth.uid() or public.is_super())));
+
+-- 18.2 由 token 找到会议（内部用）
+create or replace function public.meeting_by_token(p_token text)
+returns public.meetings language sql stable security definer set search_path = public as $$
+  select * from public.meetings where share_token = btrim(coalesce(p_token, ''));
+$$;
+
+-- 18.3 人员键：有工号用工号，否则用姓名
+create or replace function public.person_key_of(p_emp_no text, p_name text)
+returns text language sql immutable as $$
+  select case
+    when btrim(coalesce(p_emp_no, '')) <> '' then 'e:' || lower(btrim(p_emp_no))
+    else 'n:' || lower(regexp_replace(btrim(coalesce(p_name, '')), '\s', '', 'g'))
+  end;
+$$;
+
+-- 18.4 从布局里查某人的座位（返回 {seat_key, seat_label, scene_name}）
+create or replace function public.seat_of_person(p_layout jsonb, p_person_key text)
+returns jsonb language plpgsql immutable as $$
+declare
+  v_key text;
+  v_seat jsonb;
+  v_scene text := '';
+begin
+  if p_layout is null or p_person_key is null then
+    return jsonb_build_object('seat_key','', 'seat_label','', 'scene_name','');
+  end if;
+
+  select k into v_key
+    from jsonb_each_text(coalesce(p_layout->'assign', '{}'::jsonb)) as t(k, v)
+   where t.v = p_person_key
+   limit 1;
+
+  if v_key is null then
+    return jsonb_build_object('seat_key','', 'seat_label','', 'scene_name','');
+  end if;
+
+  select s into v_seat
+    from jsonb_array_elements(coalesce(p_layout->'seats','[]'::jsonb)) s
+   where s->>'key' = v_key
+   limit 1;
+
+  if v_seat is not null then
+    v_scene := coalesce(v_seat->>'sceneName', '');
+    return jsonb_build_object(
+      'seat_key',   v_key,
+      'seat_label', coalesce(v_seat->>'label', ''),
+      'scene_name', v_scene
+    );
+  end if;
+
+  return jsonb_build_object('seat_key', v_key, 'seat_label','', 'scene_name','');
+end $$;
+
+-- 18.4.1 双键查座（放在 seat_of_person 之后，避免"函数不存在"）：名单里没录工号时，参会人自己填的工号也要能对上
+create or replace function public.seat_of_person_any(p_layout jsonb, p_emp_no text, p_name text)
+returns jsonb language sql immutable as $$
+  select case
+    when public.seat_of_person(p_layout, 'e:' || lower(btrim(coalesce(p_emp_no, ''))))->>'seat_key' <> ''
+      then public.seat_of_person(p_layout, 'e:' || lower(btrim(coalesce(p_emp_no, ''))))
+    else public.seat_of_person(p_layout, 'n:' || lower(regexp_replace(btrim(coalesce(p_name, '')), '\s', '', 'g')))
+  end;
+$$;
+
+-- 18.5 签到是否开放
+create or replace function public.checkin_is_open(p_m public.meetings)
+returns boolean language sql stable as $$
+  select p_m.layout_enabled
+     and (p_m.checkin_start is null or now() >= p_m.checkin_start)
+     and (p_m.checkin_end   is null or now() <= p_m.checkin_end);
+$$;
+
+-- 18.6 参会人查询签到状态 + 自己的座位
+create or replace function public.checkin_info(p_token text, p_emp_no text default '', p_name text default '')
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  m public.meetings;
+  v_pk text;
+  v_ci public.checkins;
+  v_seat jsonb := jsonb_build_object('seat_key','','seat_label','','scene_name','');
+begin
+  select * into m from public.meetings where share_token = btrim(coalesce(p_token, ''));
+  if not found then
+    return jsonb_build_object('ok', false, 'error', '链接无效');
+  end if;
+
+  v_pk := public.person_key_of(p_emp_no, p_name);
+
+  select * into v_ci from public.checkins
+   where meeting_id = m.id
+     and (person_key = v_pk
+          or (coalesce(p_emp_no,'') <> '' and person_key = 'e:' || lower(btrim(p_emp_no)))
+          or (coalesce(p_name,'') <> '' and name = btrim(p_name)))
+   limit 1;
+
+  if v_ci.id is not null then
+    return jsonb_build_object('ok', true,
+      'layout_enabled', m.layout_enabled,
+      'open', false,
+      'checked_in', true,
+      'checked_in_at', v_ci.checked_in_at,
+      'seat', jsonb_build_object('seat_key', v_ci.seat_key,
+                                 'seat_label', v_ci.seat_label,
+                                 'scene_name', v_ci.scene_name));
+  end if;
+
+  -- 没签到过，但布局里已经给他排了座，先告诉他座位在哪
+  if m.layout_enabled then
+     select public.seat_of_person_any(l.layout, p_emp_no, p_name) into v_seat
+     from public.meeting_layouts l where l.meeting_id = m.id;
+  end if;
+
+  return jsonb_build_object('ok', true,
+    'layout_enabled', m.layout_enabled,
+    'open', public.checkin_is_open(m),
+    'checked_in', false,
+    'start', m.checkin_start,
+    'end', m.checkin_end,
+    'person_key', v_pk,
+    'seat', coalesce(v_seat, jsonb_build_object('seat_key','','seat_label','','scene_name','')));
+end $$;
+
+-- 18.7 提交签到
+create or replace function public.submit_checkin(p_token text, p_emp_no text, p_name text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  m public.meetings;
+  v_ci public.checkins;
+  v_locked boolean := false;
+  v_pk text;
+  v_name text := btrim(coalesce(p_name, ''));
+  v_seat jsonb := jsonb_build_object('seat_key','','seat_label','','scene_name','');
+begin
+  select * into m from public.meetings where share_token = btrim(coalesce(p_token, ''));
+  if not found then
+    return jsonb_build_object('ok', false, 'error', '链接无效或会议已撤销');
+  end if;
+
+  if m.owner_id is not null then
+    select locked into v_locked from public.profiles where id = m.owner_id;
+    if coalesce(v_locked, false) then
+      return jsonb_build_object('ok', false, 'error', '该会议已暂停');
+    end if;
+  end if;
+
+  if not m.layout_enabled then
+    return jsonb_build_object('ok', false, 'error', '这场会议没有开启签到');
+  end if;
+  if not public.checkin_is_open(m) then
+    return jsonb_build_object('ok', false,
+      'error', case when m.checkin_start is not null and now() < m.checkin_start
+                 then '签到还没开始，开放时间：' || to_char(m.checkin_start, 'YYYY-MM-DD HH24:MI')
+                 else '签到已截止' end);
+  end if;
+
+  if length(v_name) < 2 or length(v_name) > 20 then
+    return jsonb_build_object('ok', false, 'error', '请填写本人真实姓名（2-20 字）');
+  end if;
+  if btrim(coalesce(p_emp_no, '')) = '' then
+    return jsonb_build_object('ok', false, 'error', '请填写你的工号');
+  end if;
+
+  v_pk := public.person_key_of(p_emp_no, v_name);
+
+   select public.seat_of_person_any(l.layout, p_emp_no, v_name) into v_seat
+   from public.meeting_layouts l where l.meeting_id = m.id;
+
+  insert into public.checkins as c
+    (meeting_id, person_key, emp_no, name, seat_key, scene_name, seat_label, source)
+  values
+    (m.id, v_pk, lower(btrim(p_emp_no)), v_name,
+     coalesce(v_seat->>'seat_key',''), coalesce(v_seat->>'scene_name',''),
+     coalesce(v_seat->>'seat_label',''), 'link')
+  on conflict (meeting_id, person_key) do update
+    set name = excluded.name,
+        emp_no = excluded.emp_no,
+        seat_key = case when excluded.seat_key = '' then c.seat_key else excluded.seat_key end,
+        scene_name = case when excluded.scene_name = '' then c.scene_name else excluded.scene_name end,
+        seat_label = case when excluded.seat_label = '' then c.seat_label else excluded.seat_label end
+  returning * into v_ci;
+
+  return jsonb_build_object('ok', true,
+    'checked_in_at', v_ci.checked_in_at,
+    'name', v_ci.name,
+    'seat', jsonb_build_object('seat_key', v_ci.seat_key,
+                               'seat_label', v_ci.seat_label,
+                               'scene_name', v_ci.scene_name));
+end $$;
+
+-- 18.8 参会人查看座位图（只给几何 + 自己那一格，不下发别人姓名）
+create or replace function public.seat_map(p_token text, p_emp_no text default '', p_name text default '')
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  m public.meetings;
+  v_pk text;
+  v_layout jsonb;
+  v_seat jsonb;
+  v_style jsonb;
+begin
+  select * into m from public.meetings where share_token = btrim(coalesce(p_token, ''));
+  if not found then
+    return jsonb_build_object('ok', false, 'error', '链接无效');
+  end if;
+  if not m.layout_enabled then
+    return jsonb_build_object('ok', false, 'error', '这场会议没有座位图');
+  end if;
+
+  select layout into v_layout from public.meeting_layouts where meeting_id = m.id;
+  if v_layout is null then
+    return jsonb_build_object('ok', false, 'error', '会议还没有排座位');
+  end if;
+
+  v_pk := public.person_key_of(p_emp_no, p_name);
+  v_seat := public.seat_of_person_any(v_layout, p_emp_no, p_name);
+
+  return jsonb_build_object(
+    'ok', true,
+    'mode', coalesce(v_layout->>'mode', 'grid'),
+    'style', coalesce(v_layout->'style', '{}'::jsonb),
+    'canvas', coalesce(v_layout->'canvas', '{}'::jsonb),
+    'seats', coalesce(v_layout->'seats', '[]'::jsonb),      -- 只有几何与标签，没有姓名
+    'scenes', coalesce(v_layout->'scenes', '[]'::jsonb),
+    'my_seat_key', coalesce(v_seat->>'seat_key',''),
+    'my_seat_label', coalesce(v_seat->>'seat_label',''),
+    'my_scene_name', coalesce(v_seat->>'scene_name','')
+  );
+end $$;
+
+-- 18.9 授权
+revoke all on function public.meeting_by_token(text) from public;
+revoke all on function public.seat_of_person(jsonb, text) from public;
+revoke all on function public.checkin_is_open(public.meetings) from public;
+revoke all on function public.checkin_info(text, text, text) from public;
+revoke all on function public.submit_checkin(text, text, text) from public;
+revoke all on function public.seat_map(text, text, text) from public;
+grant execute on function public.checkin_info(text, text, text)  to anon, authenticated;
+grant execute on function public.submit_checkin(text, text, text) to anon, authenticated;
+grant execute on function public.seat_map(text, text, text)      to anon, authenticated;

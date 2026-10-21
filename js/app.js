@@ -1,4 +1,4 @@
-/* ============================================================
+﻿/* ============================================================
  *  app.js —— 主程序（v2 多用户版）
  *
  *  路由：
@@ -18,6 +18,13 @@
   function q(id) { return document.getElementById(id); }
   function h(s) { return U.esc(s); }
   var toast = U.toast, confirmBox = U.confirmBox, promptBox = U.promptBox;
+
+  /* 单位名称：为空时整块不渲染，避免留下空行 */
+  function orgName() { return String((CFG && CFG.ORG_NAME) || '').trim(); }
+  function orgBlock(cls) {
+    var o = orgName();
+    return o ? '<div class="' + cls + '">' + h(o) + '</div>' : '';
+  }
 
   /* ================= 全局状态 ================= */
   var S = {
@@ -49,7 +56,7 @@
     var qi = raw.indexOf('?');
     if (qi >= 0) raw = raw.slice(0, qi);
     var parts = raw.split('/').filter(Boolean);
-    return { name: parts[0] || 'meetings', arg: parts[1] || '' };
+    return { name: parts[0] || 'meetings', arg: parts[1] || '', sub: parts[2] || '' };
   }
 
   function go(hash) {
@@ -211,7 +218,7 @@
       '<div class="shell">' +
         '<aside class="side">' +
           '<div class="brand"><b>' + h(CFG.APP_NAME || '会议系统') + '</b>' +
-            '<span>' + h(CFG.ORG_NAME || '') + '</span></div>' +
+            (orgName() ? '<span>' + h(orgName()) + '</span>' : '') + '</div>' +
           '<nav>' + nav.map(function (n) {
             return '<a href="' + n[3] + '" class="' + (active === n[0] ? 'on' : '') + '">' +
                    '<span class="ico">' + n[1] + '</span>' + n[2] + '</a>';
@@ -285,7 +292,26 @@
     }
 
     switch (r.name) {
-      case 'meeting': wrap(viewDetail(r.arg)); afterDetail(r.arg); break;
+      case 'meeting':
+        if (r.sub === 'layout') {
+          if (MSLayout.state.meetingId !== r.arg || !MSLayout.state.layout) {
+            app.innerHTML = shell('meetings', '会场布局', '', '<div class="card"><div class="empty">正在加载布局…</div></div>');
+            MSLayout.open(r.arg).then(function () { render(); })
+              .catch(function (e) { toast(String(e.message || e), 'err'); });
+            return;
+          }
+          wrap(MSLayout.viewLayout()); MSLayout.bindLayout(); return;
+        }
+        if (r.sub === 'checkin') {
+          if (MSCheckin.state.meetingId !== r.arg || !MSCheckin.state.meeting) {
+            app.innerHTML = shell('meetings', '签到', '', '<div class="card"><div class="empty">正在加载签到…</div></div>');
+            MSCheckin.open(r.arg).then(function () { render(); })
+              .catch(function (e) { toast(String(e.message || e), 'err'); });
+            return;
+          }
+          wrap(MSCheckin.viewCheckin()); MSCheckin.bindCheckin(); return;
+        }
+        wrap(viewDetail(r.arg)); afterDetail(r.arg); break;
       case 'new': wrap(viewForm(null)); bindForm(null); break;
       case 'edit': wrap(viewForm(r.arg)); bindForm(r.arg); break;
       case 'roster': wrap(viewRoster()); afterRoster(); break;
@@ -566,6 +592,8 @@
       '<div class="btn-row" style="margin-bottom:14px">' +
         '<button class="btn ghost sm" data-go="#/meetings">← 返回看板</button>' +
         '<button class="btn ghost sm" data-go="#/edit/' + h(m.id) + '">✎ 编辑会议</button>' +
+        '<button class="btn ghost sm" data-go="#/meeting/' + h(m.id) + '/layout">🪑 会场布局</button>' +
+        '<button class="btn ghost sm" data-go="#/meeting/' + h(m.id) + '/checkin">✅ 签到管理</button>' +
         '<button class="btn ghost sm" id="d-refresh">⟳ 刷新回执</button>' +
         '<button class="btn ghost sm" id="d-export">⤓ 导出本场</button>' +
         '<span class="sp" style="flex:1"></span>' +
@@ -879,6 +907,7 @@
         '<label class="f" style="display:flex;gap:22px;flex-wrap:wrap">' +
           '<span><input type="checkbox" id="f-ask-reason" ' + (draft.ask_reason !== false ? 'checked' : '') + '> 二级网页收集「不参会原因」</span>' +
           '<span><input type="checkbox" id="f-ask-note" ' + (draft.ask_note !== false ? 'checked' : '') + '> 二级网页收集「备注」</span>' +
+          '<span><input type="checkbox" id="f-layout" ' + (draft.layout_enabled ? 'checked' : '') + '> 需要会场布局（座位图 + 签到）</span>' +
         '</label>' +
       '</div></div>' +
 
@@ -1016,6 +1045,7 @@
       agenda: (q('f-agenda') && q('f-agenda').value) || '',
       ask_reason: !!(q('f-ask-reason') && q('f-ask-reason').checked),
       ask_note: !!(q('f-ask-note') && q('f-ask-note').checked),
+      layout_enabled: !!(q('f-layout') && q('f-layout').checked),
       deadline: U.fromLocalInput(q('f-deadline') ? q('f-deadline').value : '')
     };
   }
@@ -1321,7 +1351,7 @@
    * ============================================================ */
   function viewShare(token) {
     return '<div class="share-page"><div class="share-wrap" id="share-root">' +
-      '<div class="share-head"><div class="org">' + h(CFG.ORG_NAME || '') + '</div>' +
+      '<div class="share-head">' + orgBlock('org') +
       '<h1>会议参会确认</h1></div>' +
       '<div class="share-card"><div class="bd"><div class="empty">正在加载会议信息…</div></div></div>' +
       '</div></div>';
@@ -1341,7 +1371,7 @@
   }
 
   function shareError(msg) {
-    return '<div class="share-head"><div class="org">' + h(CFG.ORG_NAME || '') + '</div>' +
+    return '<div class="share-head">' + orgBlock('org') +
       '<h1>会议参会确认</h1></div>' +
       '<div class="share-card"><div class="bd">' +
       '<div class="notice err" style="margin:0">' + h(msg) + '</div>' +
@@ -1371,7 +1401,7 @@
     var names = st.data.names || [];
 
     box.innerHTML =
-      '<div class="share-head"><div class="org">' + h(CFG.ORG_NAME || '') + '</div>' +
+      '<div class="share-head">' + orgBlock('org') +
       '<h1>' + h(m.title) + '</h1></div>' +
 
       '<div class="share-card"><div class="hd">📋 会议信息</div>' + meetingInfoHtml(m) +
@@ -1415,6 +1445,7 @@
             '</div>' +
           '</div></div>') +
 
+      '<div id="s-checkin"></div>' +
       '<div class="share-foot">' + h(CFG.APP_NAME || '') + '</div>';
 
     if (m.closed) return;
@@ -1464,6 +1495,8 @@
     }
     nameInput.addEventListener('change', loadMine);
     if (empInput) empInput.addEventListener('change', loadMine);
+    nameInput.addEventListener('change', function () { refreshCheckinCard(st.token, m); });
+    if (empInput) empInput.addEventListener('change', function () { refreshCheckinCard(st.token, m); });
 
     q('s-submit').addEventListener('click', function () {
       var emp = empInput ? empInput.value.trim() : '';
@@ -1496,7 +1529,7 @@
     var box = q('share-root');
     var yes = !!r.attending;
     box.innerHTML =
-      '<div class="share-head"><div class="org">' + h(CFG.ORG_NAME || '') + '</div>' +
+      '<div class="share-head">' + orgBlock('org') +
       '<h1>' + h(m.title) + '</h1></div>' +
       '<div class="share-card"><div class="bd">' +
         '<div class="done-mark">' +
@@ -1511,10 +1544,73 @@
         '<button class="btn ghost lg" id="s-again" style="width:100%">修改我的确认</button>' +
       '</div></div>' +
       '<div class="share-card"><div class="hd">📋 会议信息</div>' + meetingInfoHtml(m) + '</div>' +
+      '<div id="s-checkin"></div>' +
       '<div class="share-foot">' + h(CFG.APP_NAME || '') + '</div>';
+    refreshCheckinCard(st.token, m);
     var again = q('s-again');
     if (again) again.addEventListener('click', function () { renderShareForm(); });
     window.scrollTo(0, 0);
+  }
+
+  /* ================= 参会人页面：签到卡片 ================= */
+  function refreshCheckinCard(token, m) {
+    var box = q('s-checkin');
+    if (!box) return;
+    var emp = (q('s-emp') || {}).value || '';
+    var name = (q('s-name') || {}).value || '';
+    DB.checkinInfo(token, emp, name).then(function (ci) {
+      if (!ci || !ci.ok || !ci.layout_enabled) { box.innerHTML = ''; return; }
+
+      if (ci.checked_in) {
+        var seat = ci.seat || {};
+        box.innerHTML = '<div class="share-card"><div class="hd">✅ 已签到</div><div class="bd">' +
+          '<div class="done-mark" style="padding:0 0 10px"><div class="tt">签到成功</div>' +
+            '<div class="ss">' + h(ci.checked_in_at ? U.fmtDateTime(ci.checked_in_at) : '') + '</div></div>' +
+          (seat.seat_label
+            ? '<div class="notice ok" style="margin:0">您的座位：<b>' +
+                h((seat.scene_name ? seat.scene_name + ' · ' : '') + seat.seat_label) + '</b></div>'
+            : '<div class="notice info" style="margin:0">现场未排座位，请听从工作人员安排。</div>') +
+        '</div></div>';
+        return;
+      }
+
+      if (!ci.open) {
+        var msg = (ci.start && new Date(ci.start).getTime() > Date.now())
+          ? '签到还没开始，开放时间：' + U.fmtDateTime(ci.start)
+          : (ci.end ? '签到已截止（' + U.fmtDateTime(ci.end) + '）' : '签到暂未开放');
+        box.innerHTML = '<div class="share-card"><div class="bd">' +
+          '<div class="notice warn" style="margin:0">' + h(msg) + '</div></div></div>';
+        return;
+      }
+
+      box.innerHTML = '<div class="share-card"><div class="hd">✅ 现场签到</div><div class="bd">' +
+        (ci.seat && ci.seat.seat_label
+          ? '<div class="hint" style="margin-bottom:10px">您的座位：<b>' + h(ci.seat.seat_label) + '</b></div>' : '') +
+        '<button class="btn lg" id="s-checkin-btn" style="width:100%">我要签到</button>' +
+        '<div class="hint" style="text-align:center;margin-top:6px">先在上面填好工号和姓名，再点签到</div>' +
+        '</div></div>';
+
+      var btn = q('s-checkin-btn');
+      if (btn) btn.addEventListener('click', function () {
+        var e2 = (q('s-emp') || {}).value || '';
+        var n2 = (q('s-name') || {}).value || '';
+        if (!e2) { toast('请先填写工号', 'warn'); return; }
+        if (!n2 || n2.length < 2) { toast('请先填写姓名', 'warn'); return; }
+        btn.disabled = true; btn.textContent = '签到中…';
+        DB.submitCheckin(token, e2, n2).then(function (r) {
+          if (!r || !r.ok) {
+            btn.disabled = false; btn.textContent = '我要签到';
+            toast((r && r.error) || '签到失败', 'err');
+            return;
+          }
+          toast('签到成功' + (r.seat && r.seat.seat_label ? '，座位 ' + r.seat.seat_label : ''), 'ok');
+          refreshCheckinCard(token, m);
+        }).catch(function (err) {
+          btn.disabled = false; btn.textContent = '我要签到';
+          toast(String(err.message || err), 'err');
+        });
+      });
+    }).catch(function () { box.innerHTML = ''; });
   }
 
   /* ================= 对外暴露 ================= */
