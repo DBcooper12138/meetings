@@ -1,4 +1,4 @@
-﻿/* ============================================================
+/* ============================================================
  *  db.js —— 数据访问层（v2 多用户版）
  *
  *  · 首选：Supabase 云端（Auth 登录 + RLS 按用户隔离）
@@ -424,7 +424,7 @@
     if (!isCloud()) {
       var db = readLocal();
       var me = db.profile || {};
-      var unlimited = !!(me.is_super || (me.plan_expires_at && new Date(me.plan_expires_at) > new Date()));
+      var unlimited = !!((me.is_super && !me.preview_member) || (me.plan_expires_at && new Date(me.plan_expires_at) > new Date()));
       var r = me.quota_remind_used || 0, p = me.quota_promote_used || 0;
       return Promise.resolve({
         ok: true, unlimited: unlimited, limit: QUOTA_LIMIT,
@@ -440,7 +440,7 @@
       var db = readLocal();
       var me = db.profile;
       if (!me) return Promise.resolve({ ok: false, error: '请先登录' });
-      var unlimited = !!(me.is_super || (me.plan_expires_at && new Date(me.plan_expires_at) > new Date()));
+      var unlimited = !!((me.is_super && !me.preview_member) || (me.plan_expires_at && new Date(me.plan_expires_at) > new Date()));
       if (unlimited) return Promise.resolve({ ok: true, unlimited: true });
       var field = kind === 'remind' ? 'quota_remind_used' : 'quota_promote_used';
       var used = me[field] || 0;
@@ -510,14 +510,35 @@
   function listRoster() {
     if (!isCloud()) {
       var db = readLocal();
-      return Promise.resolve(db.roster.slice().sort(function (a, b) {
+      var umap = {};
+      (db.users || []).forEach(function (u) { umap[u.id] = u; });
+      return Promise.resolve(db.roster.slice().map(function (x) {
+        var u = umap[x.owner_id] || {};
+        return Object.assign({}, x, { owner_name: u.name || '', owner_emp_no: u.emp_no || '' });
+      }).sort(function (a, b) {
         return (a.sort_no || 0) - (b.sort_no || 0);
       }));
     }
     return client().from('roster').select('*')
       .order('sort_no', { ascending: true })
       .order('dept', { ascending: true })
-      .then(function (r) { return unwrap(r, '读取名单') || []; });
+      .then(function (r) {
+        var rows = unwrap(r, '读取名单') || [];
+        // 超管能看到所有人的名单：补上归属人，便于按用户区分
+        var ids = [];
+        rows.forEach(function (x) { if (x.owner_id && ids.indexOf(x.owner_id) < 0) ids.push(x.owner_id); });
+        if (!ids.length) return rows;
+        return client().from('profiles').select('id,name,emp_no').in('id', ids)
+          .then(function (pr) {
+            var list = unwrap(pr, '读取用户') || [];
+            var map = {};
+            list.forEach(function (u) { map[u.id] = u; });
+            return rows.map(function (x) {
+              var u = map[x.owner_id] || {};
+              return Object.assign({}, x, { owner_name: u.name || '', owner_emp_no: u.emp_no || '' });
+            });
+          }).catch(function () { return rows; });
+      });
   }
 
   function insertRoster(rows) {
@@ -709,6 +730,7 @@
           location: m.location, convene_dept: m.convene_dept, host: m.host, contact: m.contact,
           agenda: m.agenda, ask_reason: m.ask_reason !== false, ask_note: m.ask_note !== false,
           deadline: m.deadline, closed: closed, invite_count: (m.invite || []).length,
+          layout_enabled: !!m.layout_enabled,
           organizer: (db.profile && db.profile.name) || ''
         },
         names: (m.invite || []).map(function (x) { return x.name; })
@@ -972,6 +994,63 @@
       .then(function (r) { return unwrap(r, '读取座位图'); });
   }
 
+
+  /* 超管：以普通会员身份预览 */
+  function setPreviewMode(on) {
+    if (!isCloud()) {
+      var db = readLocal();
+      if (db.profile) db.profile.preview_member = !!on;
+      writeLocal(db);
+      return Promise.resolve({ ok: true, preview: !!on });
+    }
+    return client().rpc('set_preview_mode', { p_on: !!on })
+      .then(function (r) { return unwrap(r, '切换身份'); });
+  }
+
+  /* ================= 布局模板（会议室样式） ================= */
+  function listTemplates() {
+    if (!isCloud()) {
+      var db = readLocal();
+      return Promise.resolve((db.templates || []).slice().sort(function (x, y) {
+        return x.created_at < y.created_at ? 1 : -1;
+      }));
+    }
+    return client().from('layout_templates').select('*')
+      .order('created_at', { ascending: false })
+      .then(function (r) { return unwrap(r, '读取模板') || []; });
+  }
+
+  function saveTemplate(name, mode, layout) {
+    if (!isCloud()) {
+      var db = readLocal();
+      db.templates = db.templates || [];
+      var me = db.profile || {};
+      var hit = db.templates.filter(function (x) { return x.name === name; })[0];
+      if (hit) {
+        hit.mode = mode; hit.layout = layout; hit.updated_at = nowISO();
+      } else {
+        db.templates.push({ id: uuid(), owner_id: me.id, name: name, mode: mode,
+          layout: layout, created_at: nowISO(), updated_at: nowISO() });
+      }
+      writeLocal(db);
+      return Promise.resolve({ ok: true, name: name });
+    }
+    return client().rpc('save_layout_template', {
+      p_name: name, p_mode: mode || 'grid', p_layout: layout
+    }).then(function (r) { return unwrap(r, '保存模板'); });
+  }
+
+  function deleteTemplate(id) {
+    if (!isCloud()) {
+      var db = readLocal();
+      db.templates = (db.templates || []).filter(function (x) { return x.id !== id; });
+      writeLocal(db);
+      return Promise.resolve(true);
+    }
+    return client().from('layout_templates').delete().eq('id', id)
+      .then(function (r) { return unwrap(r, '删除模板'); });
+  }
+
   /* ================= 超级管理员 ================= */
   var admin = {
     listUsers: function () {
@@ -1192,6 +1271,8 @@
     updateMeeting: updateMeeting, deleteMeeting: deleteMeeting,
     listResponses: listResponses, listAllResponses: listAllResponses, deleteResponse: deleteResponse,
     getLayout: getLayout, saveLayout: saveLayout,
+    listTemplates: listTemplates, saveTemplate: saveTemplate, deleteTemplate: deleteTemplate,
+    setPreviewMode: setPreviewMode,
     listCheckins: listCheckins, manualCheckin: manualCheckin, deleteCheckin: deleteCheckin,
     checkinInfo: checkinInfo, submitCheckin: submitCheckin, seatMap: seatMap,
     openMeeting: openMeeting, submitResponse: submitResponse, myResponse: myResponse,

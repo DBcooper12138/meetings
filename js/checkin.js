@@ -20,7 +20,7 @@
   var C = { meetingId: '', meeting: null, checkins: [], responses: [] };
 
   function shareUrl(token) {
-    return location.href.split('#')[0] + '#/s/' + token;
+    return location.href.split('#')[0] + '#/c/' + token;   // 签到专用链接
   }
 
   /* 人员键：工号优先 */
@@ -123,8 +123,8 @@
             '<button class="btn sm" id="ck-save">保存时间</button>' +
             '<button class="btn ghost sm" id="ck-quick">设为"现在开始，2 小时后截止"</button>' +
           '</div>' +
-          '<div class="hint" style="margin-top:8px">参会人扫码打开的是同一个确认链接；' +
-          '在签到时间内，页面会多出「我要签到」按钮，签完直接显示座位。</div>' +
+          '<div class="hint" style="margin-top:8px">这是<b>签到专用链接</b>（和参会确认链接分开）：' +
+          '扫码后直接进签到页，填工号+姓名 → 点签到 → 立刻显示座位。</div>' +
         '</div></div>' +
 
       '<div class="card" style="margin-bottom:14px"><div class="card-h"><h2>签到二维码</h2></div>' +

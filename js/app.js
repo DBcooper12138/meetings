@@ -258,6 +258,12 @@
     var app = q('app');
     var wrap = function (html) { app.innerHTML = html; afterShell(); };
 
+    if (r.name === 'c') {
+      app.innerHTML = viewCheckinPage();
+      afterCheckinPage(r.arg);
+      return;
+    }
+
     if (r.name === 's') {
       app.innerHTML = viewShare(r.arg);
       afterShare(r.arg);
@@ -342,10 +348,12 @@
     var p = S.profile || {};
     var superUser = !!p.is_super;
     var exp = p.plan_expires_at ? new Date(p.plan_expires_at) : null;
-    var active = superUser || (exp && exp.getTime() > Date.now());
+    // 超管开了「以普通会员身份预览」就按真实套餐算
+    var superEff = superUser && !p.preview_member;
+    var active = superEff || (exp && exp.getTime() > Date.now());
     var myMeetings = S.meetings.filter(function (m) { return m.owner_id === p.id; });
     return {
-      isSuper: superUser,
+      isSuper: superUser, superEff: superEff,
       active: !!active,
       expires: exp,
       daysLeft: active && exp ? Math.max(0, Math.ceil((exp.getTime() - Date.now()) / 86400000)) : 0,
@@ -814,7 +822,7 @@
 
   function availableCategories() {
     var set = [];
-    S.roster.forEach(function (p) {
+    ownRoster().forEach(function (p) {
       if (p.category && set.indexOf(p.category) < 0) set.push(p.category);
     });
     set.sort(function (a, b) {
@@ -826,7 +834,7 @@
   }
 
   function rosterByCat(cat) {
-    return S.roster.filter(function (p) { return p.category === cat && p.active !== false; })
+    return ownRoster().filter(function (p) { return p.category === cat && p.active !== false; })
       .sort(function (a, b) { return (a.dept || '').localeCompare(b.dept || '', 'zh'); });
   }
 
@@ -836,6 +844,15 @@
     el.focus();
     try { el.setSelectionRange(pos, pos); } catch (e) {}
   }
+  /* 只取「我这个账号的」名单（超管也不混入别人的）
+     没有归属人的历史数据仍算自己的，避免丢数据 */
+  function ownRoster() {
+    var me = S.profile && S.profile.id;
+    return S.roster.filter(function (x) {
+      return !x.owner_id || x.owner_id === me;
+    });
+  }
+
 
   function viewForm(editId) {
     var isEdit = !!editId;
@@ -964,7 +981,7 @@
           list.map(personRow).join('');
       }).join('');
 
-      var other = S.roster.filter(function (p) {
+      var other = ownRoster().filter(function (p) {
         return p.active !== false && (!p.category || cats.indexOf(p.category) < 0);
       }).filter(match);
       if (other.length) {
@@ -1021,7 +1038,7 @@
       renderPeople();
     });
     q('f-cat-all').addEventListener('click', function () {
-      S.roster.forEach(function (p) { if (p.active !== false) S.selectedInvite[inviteKey(p)] = true; });
+      ownRoster().forEach(function (p) { if (p.active !== false) S.selectedInvite[inviteKey(p)] = true; });
       renderPeople();
     });
     q('f-cat-none').addEventListener('click', function () {
@@ -1054,7 +1071,7 @@
     var data = collectForm();
     if (!data.title) { toast('请填写会议名称', 'warn'); q('f-title').focus(); return; }
 
-    var invite = S.roster.filter(function (p) {
+    var invite = ownRoster().filter(function (p) {
       return p.active !== false && S.selectedInvite[inviteKey(p)];
     }).map(function (p) {
       return { name: p.name, emp_no: p.emp_no || '', dept: p.dept || '', category: p.category || '', rid: p.id };
@@ -1102,9 +1119,13 @@
    * ============================================================ */
   function viewRoster() {
     var f = S.rosterFilter;
+    var isSuper = !!(S.profile && S.profile.is_super);
+    var owners = {};
+    S.roster.forEach(function (x) { if (x.owner_id) owners[x.owner_id] = x.owner_name || x.owner_emp_no || '未命名'; });
     var list = S.roster.slice().sort(function (a, b) {
       return (a.sort_no || 0) - (b.sort_no || 0) || (a.dept || '').localeCompare(b.dept || '');
     }).filter(function (p) {
+      if (S.rosterOwner && S.rosterOwner !== 'all' && p.owner_id !== S.rosterOwner) return false;
       if (f.cat && p.category !== f.cat) return false;
       if (f.kw) {
         var k = f.kw.toLowerCase();
@@ -1129,6 +1150,7 @@
         '<td><input class="input" style="padding:4px 7px;font-size:13px" data-rf="dept" data-rid="' + h(p.id) + '" value="' + h(p.dept) + '"></td>' +
         '<td><input class="input" style="padding:4px 7px;font-size:13px;min-width:100px" data-rf="phone" data-rid="' + h(p.id) + '" value="' + h(p.phone || '') + '"></td>' +
         '<td><input class="input" style="padding:4px 7px;font-size:13px" data-rf="note" data-rid="' + h(p.id) + '" value="' + h(p.note || '') + '"></td>' +
+        (isSuper ? '<td class="mini">' + h(p.owner_name || '—') + (p.owner_emp_no ? '（' + h(p.owner_emp_no) + '）' : '') + '</td>' : '') +
         '<td class="ctr"><button class="btn ghost sm" data-rdel="' + h(p.id) + '">删除</button></td>' +
       '</tr>';
     }).join('');
@@ -1167,6 +1189,7 @@
       '</div>' +
       '<div class="card-b" style="border-bottom:1px solid var(--line);display:flex;gap:10px;flex-wrap:wrap;align-items:center">' +
         '<input class="input" id="r-kw" style="width:230px" placeholder="搜索姓名 / 工号 / 部门" value="' + h(f.kw) + '">' +
+        (isSuper ? '<select class="input" id="r-owner" style="width:180px"><option value="all">全部用户（总体）</option>' + Object.keys(owners).map(function (id) { return '<option value="' + h(id) + '"' + (S.rosterOwner === id ? ' selected' : '') + '>' + h(owners[id]) + '</option>'; }).join('') + '</select>' : '') +
         '<select class="input" id="r-cat" style="width:170px"><option value="">全部类别</option>' +
           cats.map(function (c) {
             return '<option value="' + h(c) + '"' + (f.cat === c ? ' selected' : '') + '>' + h(c) + '</option>';
@@ -1176,7 +1199,8 @@
         (selectedN ? '<button class="btn danger sm" id="r-del-sel">删除选中 ' + selectedN + ' 人</button>' : '') +
       '</div>' +
       '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
-        '<th style="width:34px"></th><th>#</th><th>工号</th><th>姓名</th><th>类别</th><th>部门</th><th>手机号</th><th>备注</th><th></th>' +
+        '<th style="width:34px"></th><th>#</th><th>工号</th><th>姓名</th><th>类别</th><th>部门</th><th>手机号</th><th>备注</th>' +
+        (isSuper ? '<th>所属用户</th>' : '') + '<th></th>' +
       '</tr></thead><tbody>' +
         (rows || '<tr><td colspan="9"><div class="empty"><span class="big">👥</span>名单是空的，点右上角「从 Excel 导入」或「写入初始 55 人名单」</div></td></tr>') +
       '</tbody></table></div></div>';
@@ -1202,6 +1226,9 @@
       render();
       restoreCaret('r-kw', pos);
     });
+    var ow = q('r-owner');
+    if (ow) ow.addEventListener('change', function () { S.rosterOwner = ow.value; render(); });
+
     var cs = q('r-cat');
     if (cs) cs.addEventListener('change', function () { S.rosterFilter.cat = cs.value; render(); });
 
@@ -1495,8 +1522,6 @@
     }
     nameInput.addEventListener('change', loadMine);
     if (empInput) empInput.addEventListener('change', loadMine);
-    nameInput.addEventListener('change', function () { refreshCheckinCard(st.token, m); });
-    if (empInput) empInput.addEventListener('change', function () { refreshCheckinCard(st.token, m); });
 
     q('s-submit').addEventListener('click', function () {
       var emp = empInput ? empInput.value.trim() : '';
@@ -1546,7 +1571,6 @@
       '<div class="share-card"><div class="hd">📋 会议信息</div>' + meetingInfoHtml(m) + '</div>' +
       '<div id="s-checkin"></div>' +
       '<div class="share-foot">' + h(CFG.APP_NAME || '') + '</div>';
-    refreshCheckinCard(st.token, m);
     var again = q('s-again');
     if (again) again.addEventListener('click', function () { renderShareForm(); });
     window.scrollTo(0, 0);
@@ -1611,6 +1635,106 @@
         });
       });
     }).catch(function () { box.innerHTML = ''; });
+  }
+
+  /* ================= 签到专用页（#/c/<token>） =================
+     与参会确认页（#/s/<token>）完全分开：这里只做签到，签完显示座位。 */
+  function viewCheckinPage() {
+    return '<div class="share-page"><div class="share-wrap" id="ck-root">' +
+      '<div class="share-head">' + orgBlock('org') + '<h1>会议签到</h1></div>' +
+      '<div class="share-card"><div class="bd"><div class="empty">正在加载会议信息…</div></div></div>' +
+      '</div></div>';
+  }
+
+  function ckHead(title) {
+    return '<div class="share-head">' + orgBlock('org') + '<h1>' + h(title) + '</h1></div>';
+  }
+  function ckError(msg) {
+    return '<div class="share-card"><div class="bd">' +
+      '<div class="notice err" style="margin:0">' + h(msg) + '</div>' +
+      '<div class="hint" style="margin-top:12px">请联系会议联系人核对链接。</div></div></div>';
+  }
+
+  function afterCheckinPage(token) {
+    var box = q('ck-root');
+    if (!box) return;
+    DB.openMeeting(token).then(function (res) {
+      if (!res || !res.ok) { box.innerHTML = ckHead('会议签到') + ckError(res && res.error || '链接无效'); return; }
+      var m = res.meeting;
+      if (!m.layout_enabled) {
+        box.innerHTML = ckHead(m.title) + ckError('这场会议没有开启签到');
+        return;
+      }
+      return DB.checkinInfo(token, '', '').then(function (ci) {
+        box.innerHTML = ckHead(m.title) + ckBody(m, ci, token);
+        ckBind(m, token, ci);
+      });
+    }).catch(function (e) {
+      box.innerHTML = ckHead('会议签到') + ckError(String(e.message || e));
+    });
+  }
+
+  function ckBody(m, ci, token) {
+    var info = '<div class="share-card"><div class="hd">📋 会议信息</div>' + meetingInfoHtml(m) + '</div>';
+
+    if (!ci || !ci.open) {
+      var msg = (ci && ci.start && new Date(ci.start).getTime() > Date.now())
+        ? '签到还没开始，开放时间：' + U.fmtDateTime(ci.start)
+        : (ci && ci.end ? '签到已截止（' + U.fmtDateTime(ci.end) + '）' : '签到暂未开放');
+      return info + '<div class="share-card"><div class="bd">' +
+        '<div class="notice warn" style="margin:0">' + h(msg) + '</div></div></div>';
+    }
+
+    return info +
+      '<div class="share-card"><div class="hd">✅ 签到</div><div class="bd">' +
+        '<label class="f"><span class="lb">工号 <span class="req">*</span></span>' +
+          '<input class="input" id="ck-emp" placeholder="如 1001" autocomplete="off"></label>' +
+        '<label class="f"><span class="lb">姓名 <span class="req">*</span></span>' +
+          '<input class="input" id="ck-name" placeholder="请输入本人姓名" autocomplete="off"></label>' +
+        '<div id="ck-msg"></div>' +
+        '<button class="btn lg" id="ck-do" style="width:100%">我要签到</button>' +
+        '<div class="hint" style="text-align:center;margin-top:8px">签到后立刻显示你的座位</div>' +
+      '</div></div>';
+  }
+
+  function ckBind(m, token, ci) {
+    var btn = q('ck-do');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      var emp = (q('ck-emp') || {}).value || '';
+      var name = (q('ck-name') || {}).value || '';
+      var msg = q('ck-msg');
+      emp = emp.trim(); name = name.trim();
+      if (!emp) { toast('请填写工号', 'warn'); return; }
+      if (name.length < 2) { toast('请填写姓名', 'warn'); return; }
+      btn.disabled = true; btn.textContent = '签到中…';
+      DB.submitCheckin(token, emp, name).then(function (r) {
+        if (!r || !r.ok) {
+          btn.disabled = false; btn.textContent = '我要签到';
+          if (msg) msg.innerHTML = '<div class="notice err" style="margin:0 0 12px">' + h(r && r.error || '签到失败') + '</div>';
+          return;
+        }
+        var seat = r.seat || {};
+        var box = q('ck-root');
+        box.innerHTML = ckHead(m.title) +
+          '<div class="share-card"><div class="bd">' +
+            '<div class="done-mark"><div class="ic">✅</div>' +
+              '<div class="tt">签到成功</div>' +
+              '<div class="ss">' + h(r.name || name) + '　' + h(U.fmtDateTime(r.checked_in_at)) + '</div>' +
+            '</div>' +
+            (seat.seat_label
+              ? '<div class="seat-big">' + h((seat.scene_name ? seat.scene_name + ' · ' : '') + seat.seat_label) + '</div>' +
+                '<div class="hint" style="text-align:center">请对号入座</div>'
+              : '<div class="notice info" style="margin:0">现场未排座位，请听从工作人员安排。</div>') +
+          '</div></div>' +
+          '<div class="share-card"><div class="hd">📋 会议信息</div>' + meetingInfoHtml(m) + '</div>' +
+          '<div class="share-foot">' + h(CFG.APP_NAME || '') + '</div>';
+        window.scrollTo(0, 0);
+      }).catch(function (e) {
+        btn.disabled = false; btn.textContent = '我要签到';
+        if (msg) msg.innerHTML = '<div class="notice err" style="margin:0 0 12px">提交失败：' + h(String(e.message || e)) + '</div>';
+      });
+    });
   }
 
   /* ================= 对外暴露 ================= */

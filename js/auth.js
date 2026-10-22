@@ -426,6 +426,22 @@
       '</tr>';
     }).join('');
 
+    var previewSw = '';
+    if (p.is_super) {
+      previewSw = '<div class="notice ' + (p.preview_member ? 'warn' : 'info') + '" style="margin-bottom:14px">' +
+        '<label style="display:flex;gap:8px;align-items:center;cursor:pointer">' +
+          '<input type="checkbox" id="ac-preview" ' + (p.preview_member ? 'checked' : '') + '>' +
+          '<span><b>以普通会员身份预览</b>　' +
+          (p.preview_member
+            ? '当前按你的真实套餐计算额度（' + (ps.active ? '会员有效' : '免费额度') + '）'
+            : '当前是超管，不受任何额度限制') +
+          '</span>' +
+        '</label>' +
+        '<div class="hint" style="margin-top:6px">勾选后可真实体验"免费用户/会员"的额度限制；' +
+        '看别人数据的管理权限不受影响。</div>' +
+      '</div>';
+    }
+
     var statusChip = p.is_super
       ? '<span class="tag dark">超级管理员 · 不受额度限制</span>'
       : (isMember
@@ -615,6 +631,17 @@
       MS().refreshProfile().then(function () { return MS().refreshAccount(); })
         .then(function () { MS().render(); toast('已刷新', 'ok'); })
         .catch(function (e) { toast(String(e.message || e), 'err'); });
+    });
+
+    var pv = q('ac-preview');
+    if (pv) pv.addEventListener('change', function () {
+      pv.disabled = true;
+      DB.setPreviewMode(pv.checked).then(function () {
+        return MS().refreshProfile();
+      }).then(function () {
+        return MS().loadQuota();
+      }).then(function () { MS().render(); toast(pv.checked ? '已切换为普通会员身份' : '已恢复管理员身份', 'ok'); })
+        .catch(function (e) { pv.disabled = false; toast(String(e.message || e), 'err'); });
     });
 
     var gotoPlans = q('ac-goto-plans');

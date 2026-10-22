@@ -833,6 +833,7 @@ begin
       'ask_note',      m.ask_note,
       'deadline',      m.deadline,
       'closed',        v_closed,
+      'layout_enabled', m.layout_enabled,
       'invite_count',  jsonb_array_length(m.invite),
       'organizer',     v_owner_name
     ),
@@ -1331,3 +1332,304 @@ revoke all on function public.seat_map(text, text, text) from public;
 grant execute on function public.checkin_info(text, text, text)  to anon, authenticated;
 grant execute on function public.submit_checkin(text, text, text) to anon, authenticated;
 grant execute on function public.seat_map(text, text, text)      to anon, authenticated;
+
+-- ============================================================
+-- 19. v2.5 签到自动分座（按分区优先、随机、加锁防抢座）
+-- ============================================================
+
+-- 一个座位只能被一个人签到占用
+drop index if exists public.checkins_seat_uniq;
+create unique index if not exists checkins_seat_uniq
+  on public.checkins (meeting_id, seat_key) where seat_key <> '';
+
+-- 按"单位分区 / 身份分区 / 未分区"依次找一个空座
+create or replace function public.pick_auto_seat(
+  p_layout jsonb, p_meeting uuid, p_dept text, p_cat text)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_taken text[];
+  v_row record;
+  v_zones text[] := array[]::text[];
+begin
+  select coalesce(array_agg(seat_key), array[]::text[]) into v_taken
+    from public.checkins
+   where meeting_id = p_meeting and seat_key <> '';
+
+  if btrim(coalesce(p_dept,'')) <> '' then
+    v_zones := v_zones || ('单位·' || btrim(p_dept));
+  end if;
+  if btrim(coalesce(p_cat,'')) <> '' then
+    v_zones := v_zones || ('身份·' || btrim(p_cat));
+  end if;
+
+  -- 1) 本区空座
+  if array_length(v_zones, 1) > 0 then
+    select s into v_row
+      from jsonb_array_elements(coalesce(p_layout->'seats','[]'::jsonb)) s
+     where coalesce(p_layout->'zoneMap'->>(s->>'key'), '') = any(v_zones)
+       and not ((s->>'key') = any(v_taken))
+     order by random() limit 1;
+    if v_row.s is not null then
+      return jsonb_build_object('seat_key', v_row.s->>'key',
+        'seat_label', coalesce(v_row.s->>'label',''),
+        'scene_name', coalesce(v_row.s->>'sceneName',''),
+        'auto', true, 'matched', 'zone');
+    end if;
+  end if;
+
+  -- 2) 未分区空座
+  select s into v_row
+    from jsonb_array_elements(coalesce(p_layout->'seats','[]'::jsonb)) s
+   where coalesce(p_layout->'zoneMap'->>(s->>'key'), '') = ''
+     and not ((s->>'key') = any(v_taken))
+   order by random() limit 1;
+  if v_row.s is not null then
+    return jsonb_build_object('seat_key', v_row.s->>'key',
+      'seat_label', coalesce(v_row.s->>'label',''),
+      'scene_name', coalesce(v_row.s->>'sceneName',''),
+      'auto', true, 'matched', 'free');
+  end if;
+
+  -- 3) 任何一个空座
+  select s into v_row
+    from jsonb_array_elements(coalesce(p_layout->'seats','[]'::jsonb)) s
+   where not ((s->>'key') = any(v_taken))
+   order by random() limit 1;
+  if v_row.s is not null then
+    return jsonb_build_object('seat_key', v_row.s->>'key',
+      'seat_label', coalesce(v_row.s->>'label',''),
+      'scene_name', coalesce(v_row.s->>'sceneName',''),
+      'auto', true, 'matched', 'any');
+  end if;
+
+  return jsonb_build_object('seat_key','','seat_label','','scene_name','','auto', false, 'full', true);
+end $$;
+
+revoke all on function public.pick_auto_seat(jsonb, uuid, text, text) from public;
+grant execute on function public.pick_auto_seat(jsonb, uuid, text, text) to authenticated;
+
+-- 重写 submit_checkin：没固定座位就自动分
+create or replace function public.submit_checkin(p_token text, p_emp_no text, p_name text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  m public.meetings;
+  v_ci public.checkins;
+  v_locked boolean := false;
+  v_pk text;
+  v_name text := btrim(coalesce(p_name, ''));
+  v_layout jsonb;
+  v_seat jsonb;
+  v_dept text := '';
+  v_cat  text := '';
+  v_hit  jsonb;
+  v_auto boolean := false;
+begin
+  select * into m from public.meetings where share_token = btrim(coalesce(p_token, ''));
+  if not found then
+    return jsonb_build_object('ok', false, 'error', '链接无效或会议已撤销');
+  end if;
+
+  if m.owner_id is not null then
+    select locked into v_locked from public.profiles where id = m.owner_id;
+    if coalesce(v_locked, false) then
+      return jsonb_build_object('ok', false, 'error', '该会议已暂停');
+    end if;
+  end if;
+
+  if not m.layout_enabled then
+    return jsonb_build_object('ok', false, 'error', '这场会议没有开启签到');
+  end if;
+  if not public.checkin_is_open(m) then
+    return jsonb_build_object('ok', false,
+      'error', case when m.checkin_start is not null and now() < m.checkin_start
+                 then '签到还没开始，开放时间：' || to_char(m.checkin_start, 'YYYY-MM-DD HH24:MI')
+                 else '签到已截止' end);
+  end if;
+
+  if length(v_name) < 2 or length(v_name) > 20 then
+    return jsonb_build_object('ok', false, 'error', '请填写本人真实姓名（2-20 字）');
+  end if;
+  if btrim(coalesce(p_emp_no, '')) = '' then
+    return jsonb_build_object('ok', false, 'error', '请填写你的工号');
+  end if;
+
+  v_pk := public.person_key_of(p_emp_no, v_name);
+
+  -- 锁住布局，避免两个人同时抢到同一个座位
+  select layout into v_layout from public.meeting_layouts
+   where meeting_id = m.id for update;
+
+  -- 已有固定座位？
+  v_seat := public.seat_of_person_any(v_layout, p_emp_no, v_name);
+
+  -- 没排座：按单位/身份分区随机分一个
+  if coalesce(v_seat->>'seat_key','') = '' then
+    select s into v_hit
+      from jsonb_array_elements(coalesce(m.invite,'[]'::jsonb)) s
+     where lower(btrim(coalesce(s->>'emp_no',''))) = lower(btrim(p_emp_no))
+        or lower(btrim(coalesce(s->>'name',''))) = lower(v_name)
+     limit 1;
+    if v_hit is not null then
+      v_dept := coalesce(v_hit->>'dept','');
+      v_cat  := coalesce(v_hit->>'category','');
+    end if;
+
+    v_seat := public.pick_auto_seat(v_layout, m.id, v_dept, v_cat);
+    if coalesce(v_seat->>'full', false) then
+      return jsonb_build_object('ok', true, 'checked_in_at', now(), 'name', v_name,
+        'seat', jsonb_build_object('seat_key','','seat_label','','scene_name',''),
+        'warning', '现场座位已满，请联系工作人员');
+    end if;
+    v_auto := true;
+  end if;
+
+  insert into public.checkins as c
+    (meeting_id, person_key, emp_no, name, seat_key, scene_name, seat_label, source)
+  values
+    (m.id, v_pk, lower(btrim(p_emp_no)), v_name,
+     coalesce(v_seat->>'seat_key',''), coalesce(v_seat->>'scene_name',''),
+     coalesce(v_seat->>'seat_label',''), 'link')
+  on conflict (meeting_id, person_key) do update
+    set name = excluded.name,
+        emp_no = excluded.emp_no,
+        seat_key = case when excluded.seat_key = '' then c.seat_key else excluded.seat_key end,
+        scene_name = case when excluded.scene_name = '' then c.scene_name else excluded.scene_name end,
+        seat_label = case when excluded.seat_label = '' then c.seat_label else excluded.seat_label end
+  returning * into v_ci;
+
+  return jsonb_build_object('ok', true,
+    'checked_in_at', v_ci.checked_in_at,
+    'name', v_ci.name,
+    'auto_seat', v_auto,
+    'seat', jsonb_build_object('seat_key', v_ci.seat_key,
+                               'seat_label', v_ci.seat_label,
+                               'scene_name', v_ci.scene_name));
+end $$;
+
+revoke all on function public.submit_checkin(text, text, text) from public;
+grant execute on function public.submit_checkin(text, text, text) to anon, authenticated;
+
+-- ============================================================
+-- 20. v2.6 会议室布局模板（可复用）
+-- ============================================================
+create table if not exists public.layout_templates (
+  id         uuid primary key default gen_random_uuid(),
+  owner_id   uuid not null,
+  name       text not null,
+  mode       text not null default 'grid',
+  layout     jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (owner_id, name)
+);
+create index if not exists layout_templates_owner_idx on public.layout_templates (owner_id, created_at desc);
+
+alter table public.layout_templates enable row level security;
+drop policy if exists layout_tpl_owner_all on public.layout_templates;
+create policy layout_tpl_owner_all on public.layout_templates
+  for all to authenticated
+  using (owner_id = auth.uid() or public.is_super())
+  with check (owner_id = auth.uid() or public.is_super());
+
+-- 保存/覆盖模板（owner 由服务端取当前登录用户，前端不用传 uid）
+create or replace function public.save_layout_template(p_name text, p_mode text, p_layout jsonb)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := auth.uid(); v_row public.layout_templates;
+begin
+  if v_uid is null then
+    return jsonb_build_object('ok', false, 'error', '请先登录');
+  end if;
+  if btrim(coalesce(p_name, '')) = '' then
+    return jsonb_build_object('ok', false, 'error', '模板名不能为空');
+  end if;
+
+  insert into public.layout_templates (owner_id, name, mode, layout)
+  values (v_uid, btrim(p_name), coalesce(nullif(p_mode, ''), 'grid'), coalesce(p_layout, '{}'::jsonb))
+  on conflict (owner_id, name) do update
+    set mode = excluded.mode, layout = excluded.layout, updated_at = now()
+  returning * into v_row;
+
+  return jsonb_build_object('ok', true, 'id', v_row.id, 'name', v_row.name);
+end $$;
+
+revoke all on function public.save_layout_template(text, text, jsonb) from public;
+grant execute on function public.save_layout_template(text, text, jsonb) to authenticated;
+
+-- ============================================================
+-- 21. v2.7 超管"以普通会员身份预览"
+--     开启后：自己的账号按真实套餐算额度（1场/20人/10次/导出）
+--     关闭后：恢复超管不限额度
+--     注意：只是额度按普通会员算，看别人数据的管理权限不受影响
+-- ============================================================
+alter table public.profiles add column if not exists preview_member boolean not null default false;
+
+create or replace function public.in_preview()
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select p.preview_member from public.profiles p where p.id = auth.uid()), false);
+$$;
+
+-- 生效中的"管理员特权"：是超管且没开预览
+create or replace function public.is_super_eff()
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.is_super() and not public.in_preview();
+$$;
+
+-- 会员资格：管理员（未开预览）或套餐有效
+create or replace function public.has_active_plan()
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.is_super_eff()
+      or coalesce((select p.plan_expires_at > now() from public.profiles p where p.id = auth.uid()), false);
+$$;
+
+create or replace function public.set_preview_mode(p_on boolean)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := auth.uid();
+begin
+  if v_uid is null then
+    return jsonb_build_object('ok', false, 'error', '请先登录');
+  end if;
+  if not public.is_super() then
+    return jsonb_build_object('ok', false, 'error', '只有超级管理员可以使用身份预览');
+  end if;
+  update public.profiles set preview_member = coalesce(p_on, false) where id = v_uid;
+  return jsonb_build_object('ok', true, 'preview', coalesce(p_on, false),
+    'plan_active', public.has_active_plan());
+end $$;
+
+revoke all on function public.in_preview() from public;
+revoke all on function public.is_super_eff() from public;
+revoke all on function public.set_preview_mode(boolean) from public;
+grant execute on function public.in_preview()      to authenticated;
+grant execute on function public.is_super_eff()    to authenticated;
+grant execute on function public.set_preview_mode(boolean) to authenticated;
+
+-- 发布会议 / 保存布局 的额度判断改用"生效中的管理员特权"
+create or replace function public.check_meeting_allowed()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  v_count integer;
+  v_invite integer;
+begin
+  if public.is_super_eff() then return new; end if;
+  select count(*) into v_count from public.meetings where owner_id = new.owner_id;
+  if not public.has_active_plan() and v_count >= 1 then
+    raise exception '免费额度已用完：未开通套餐最多发布 1 场会议，购买套餐后不限场次' using errcode = '42501';
+  end if;
+  v_invite := coalesce(jsonb_array_length(new.invite), 0);
+  if not public.has_active_plan() and v_invite > 20 then
+    raise exception '免费额度限制：单场最多邀请 20 人（当前 % 人），购买套餐后不限人数', v_invite
+      using errcode = '42501';
+  end if;
+  return new;
+end $$;
+
+create or replace function public.check_layout_allowed()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_owner uuid;
+begin
+  select owner_id into v_owner from public.meetings where id = new.meeting_id;
+  if not public.is_super_eff() and not (v_owner = auth.uid() and public.has_active_plan()) then
+    raise exception '会场布局是会员功能，请先购买套餐' using errcode = '42501';
+  end if;
+  return new;
+end $$;
