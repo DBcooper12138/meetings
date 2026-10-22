@@ -111,8 +111,8 @@
 
       '<div class="card" style="margin-bottom:14px"><div class="card-h"><h2>签到设置</h2>' + statusTag + '</div>' +
         '<div class="card-b">' +
-          (m.layout_enabled ? '' : '<div class="notice warn">这场会议没有开启「会场布局」，签到不可用。' +
-            '先到 <a href="#/meeting/' + h(m.id) + '/layout">会场布局</a> 排好座位，或在编辑会议里勾选「需要会场布局」。</div>') +
+          (m.layout_enabled ? '' : '<div class="notice warn">这场会议还没有会场布局。' +
+            '<button class="btn sm" id="ck-enable" style="margin-left:10px">开启并去排版</button></div>') +
           '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">' +
             '<label class="f"><span class="lb">签到开放时间</span>' +
               '<input type="datetime-local" class="input" id="ck-start" value="' + h(U().toLocalInput(m.checkin_start)) + '"></label>' +
@@ -160,6 +160,15 @@
 
   /* ================= 绑定 ================= */
   function bindCheckin() {
+    var en = q('ck-enable');
+    if (en) en.addEventListener('click', function () {
+      en.disabled = true;
+      DB().updateMeeting(C.meetingId, { layout_enabled: true })
+        .then(function () { return MS().refreshAll(); })
+        .then(function () { MS().go('#/meeting/' + C.meetingId + '/layout'); })
+        .catch(function (e) { en.disabled = false; toast(String(e.message || e), 'err'); });
+    });
+
     var save = q('ck-save');
     if (save) save.addEventListener('click', function () {
       var s = U().fromLocalInput(q('ck-start').value);

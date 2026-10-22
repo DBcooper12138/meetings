@@ -1,4 +1,4 @@
-﻿/* ============================================================
+/* ============================================================
  *  app.js —— 主程序（v2 多用户版）
  *
  *  路由：
@@ -74,6 +74,12 @@
       .then(function (r) {
         S.meetings = r[0] || [];
         S.roster = r[1] || [];
+      // 非超管身份：只保留自己的云端数据
+      if (!isAdmin()) {
+        var meId = S.profile && S.profile.id;
+        S.meetings = (S.meetings || []).filter(function (m) { return !m.owner_id || m.owner_id === meId; });
+        S.roster = (S.roster || []).filter(function (x) { return !x.owner_id || x.owner_id === meId; });
+      }
         indexResponses(r[2] || []);
         return true;
       }).catch(function (e) {
@@ -112,7 +118,9 @@
       if (!p) throw new Error('找不到你的账号档案。可能是注册时数据库触发器未生效，请确认已执行最新的 01_schema.sql');
       S.profile = p;
       S.ready = true;
-      return Promise.all([refreshAll(), refreshAccount(), loadQuota()]);
+      DB.purgeExpired();
+      return Promise.all([refreshAll(), refreshAccount(), loadQuota(),
+        DB.listTrash().then(function (t) { S.trash = t || []; }).catch(function () { S.trash = []; })]);
     }).then(function () {
       go('#/meetings');
       render();
@@ -200,6 +208,12 @@
     });
   }
 
+  /* 当前是否"以超管身份"工作（开了普通会员预览就不是） */
+  function isAdmin() {
+    var p = S.profile || {};
+    return !!(p.is_super && !p.preview_member);
+  }
+
   function shell(active, title, actions, body) {
     var p = S.profile || {};
     var nav = [
@@ -209,7 +223,7 @@
       ['stats', '📊', '统计信息', '#/stats'],
       ['account', '💰', '我的账户', '#/account']
     ];
-    if (p.is_super) nav.push(['admin', '🛡', '超级管理员', '#/admin']);
+    if (isAdmin()) nav.push(['admin', '🛡', '超级管理员', '#/admin']);
 
     var dotCls = S.mode === 'local' ? 'local' : 'ok';
     var dotTxt = S.mode === 'local' ? '本机演示模式（数据只在本机）' : '已连接云端';
@@ -224,8 +238,13 @@
                    '<span class="ico">' + n[1] + '</span>' + n[2] + '</a>';
           }).join('') + '</nav>' +
           '<div class="side-user">' +
+            (p.is_super ? '<div class="idswitch">' +
+              '<button class="idsw' + (isAdmin() ? ' on' : '') + '" data-identity="admin">超管</button>' +
+              '<button class="idsw' + (!isAdmin() ? ' on' : '') + '" data-identity="member">普通会员</button>' +
+            '</div>' : '') +
             '<div class="su-name">' + h(p.name || '未登录') +
-              (p.is_super ? ' <span class="tag dark">超管</span>' : '') + '</div>' +
+              (p.is_super ? ' <span class="tag ' + (isAdmin() ? 'dark' : 'gray') + '">' +
+                (isAdmin() ? '超管身份' : '会员身份') + '</span>' : '') + '</div>' +
             '<div class="su-sub">工号 ' + h(p.emp_no || '—') + '</div>' +
             '<button class="btn ghost sm" id="btn-logout" style="width:100%;margin-top:8px">退出登录</button>' +
           '</div>' +
@@ -239,6 +258,30 @@
   }
 
   function afterShell() {
+    document.querySelectorAll('[data-identity]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var toAdmin = b.getAttribute('data-identity') === 'admin';
+        if (toAdmin === isAdmin()) return;
+        b.disabled = true;
+        DB.setPreviewMode(!toAdmin).then(function () {
+          return refreshProfile();
+        }).then(function () {
+          return loadQuota();
+        }).then(function () {
+          return refreshAll();
+        }).then(function () {
+          go('#/meetings');
+          toast(toAdmin ? '已切换为超管身份' : '已切换为普通会员身份', 'ok');
+        }).catch(function (e) {
+          b.disabled = false;
+          toast(String(e.message || e), 'err');
+        });
+      });
+    });
+
+    var gt = q('go-trash');
+    if (gt) gt.addEventListener('click', function () { go('#/trash'); });
+
     var lo = q('btn-logout');
     if (lo) lo.addEventListener('click', function () {
       confirmBox('确定退出登录？').then(function (ok) {
@@ -320,6 +363,7 @@
         wrap(viewDetail(r.arg)); afterDetail(r.arg); break;
       case 'new': wrap(viewForm(null)); bindForm(null); break;
       case 'edit': wrap(viewForm(r.arg)); bindForm(r.arg); break;
+      case 'trash': wrap(viewTrash()); afterTrash(); break;
       case 'roster': wrap(viewRoster()); afterRoster(); break;
       case 'stats': wrap(MSStats.viewStats()); MSStats.bindStats(); break;
       case 'account': wrap(MSAuth.viewAccount()); MSAuth.bindAccount(); break;
@@ -415,6 +459,68 @@
     return P.buildAttendance(m, (S.responsesCache && S.responsesCache[m.id]) || []).stats;
   }
 
+  /* ================= 回收站 ================= */
+  function viewTrash() {
+    var list = S.trash || [];
+    var rows = list.map(function (t) {
+      var d = t.data || {};
+      var daysLeft = 30 - Math.floor((Date.now() - new Date(t.deleted_at).getTime()) / 86400000);
+      return '<tr>' +
+        '<td class="name">' + h(d.title || t.title || '未命名会议') + '</td>' +
+        '<td class="mini">' + h(d.meet_date || '—') + '</td>' +
+        '<td class="mini">' + h(d.location || '—') + '</td>' +
+        '<td class="mini">' + U.fmtDateTime(t.deleted_at) + '</td>' +
+        '<td class="mini">' + (daysLeft > 0 ? ('还剩 ' + daysLeft + ' 天') : '即将自动删除') + '</td>' +
+        '<td class="ctr">' +
+          '<button class="btn sm" data-restore="' + h(t.id) + '">恢复</button> ' +
+          '<button class="btn ghost sm" data-purge="' + h(t.id) + '">彻底删除</button>' +
+        '</td>' +
+      '</tr>';
+    }).join('');
+
+    var body =
+      '<div class="btn-row" style="margin-bottom:14px">' +
+        '<button class="btn ghost sm" data-go="#/meetings">← 返回会议看板</button>' +
+        '<span class="sp" style="flex:1"></span>' +
+        '<span class="mini">删除的会议保留 30 天，到期自动清除</span>' +
+      '</div>' +
+      '<div class="card"><div class="card-h"><h2>回收站（' + list.length + '）</h2></div>' +
+        '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
+          '<th>会议名称</th><th>日期</th><th>地点</th><th>删除时间</th><th>保留</th><th></th>' +
+        '</tr></thead><tbody>' +
+          (rows || '<tr><td colspan="6"><div class="empty">回收站是空的</div></td></tr>') +
+        '</tbody></table></div></div>';
+
+    return shell('trash', '回收站', '', body);
+  }
+
+  function afterTrash() {
+    document.querySelectorAll('[data-restore]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var id = b.getAttribute('data-restore');
+        b.disabled = true;
+        DB.restoreMeeting(id).then(function () {
+          toast('会议已恢复', 'ok');
+          return Promise.all([DB.listTrash(), refreshAll()]);
+        }).then(function (r) {
+          S.trash = r[0] || [];
+          render();
+        }).catch(function (e) { b.disabled = false; toast(String(e.message || e), 'err'); });
+      });
+    });
+    document.querySelectorAll('[data-purge]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var id = b.getAttribute('data-purge');
+        confirmBox('彻底删除后无法恢复，确定吗？').then(function (ok) {
+          if (!ok) return;
+          DB.purgeMeeting(id).then(function () { return DB.listTrash(); })
+            .then(function (list) { S.trash = list || []; render(); toast('已彻底删除', 'ok'); })
+            .catch(function (e) { toast(String(e.message || e), 'err'); });
+        });
+      });
+    });
+  }
+
   function viewMeetings() {
     var list = S.meetings.slice().sort(function (a, b) {
       var da = a.meet_date || '', db = b.meet_date || '';
@@ -486,6 +592,7 @@
 
     return shell('meetings', '会议看板',
       '<input class="input" style="width:200px" id="mkw" placeholder="搜索会议名称/地点" value="' + h(S.keyword) + '">' +
+      '<button class="btn ghost" id="go-trash">🗑 回收站</button>' +
       '<button class="btn" data-go="#/new">＋ 发布会议</button>',
       planWarn +
       '<div class="btn-row" style="margin-bottom:16px">' +
@@ -848,9 +955,10 @@
      没有归属人的历史数据仍算自己的，避免丢数据 */
   function ownRoster() {
     var me = S.profile && S.profile.id;
-    return S.roster.filter(function (x) {
-      return !x.owner_id || x.owner_id === me;
-    });
+    var mine = S.roster.filter(function (x) { return x.owner_id && x.owner_id === me; });
+    if (mine.length) return mine;
+    // 自己名下一条都没有（可能是 v1 遗留的无归属数据）才回退
+    return S.roster.filter(function (x) { return !x.owner_id; });
   }
 
 
@@ -889,13 +997,6 @@
     S.selectedInvite = {};
     (draft.invite || []).forEach(function (p) { S.selectedInvite[inviteKey(p)] = true; });
 
-    var cats = availableCategories();
-    var catAll = cats.map(function (c) {
-      return '<label class="cat-chip" data-cat="' + h(c) + '">' +
-             '<input type="checkbox" data-catbox="' + h(c) + '"> ' + h(c) +
-             ' <span class="mini">(' + rosterByCat(c).length + ')</span></label>';
-    }).join('');
-
     var body =
       '<div class="btn-row" style="margin-bottom:14px">' +
         '<button class="btn ghost sm" data-go="#/meetings">← 返回看板</button>' +
@@ -924,19 +1025,26 @@
         '<label class="f" style="display:flex;gap:22px;flex-wrap:wrap">' +
           '<span><input type="checkbox" id="f-ask-reason" ' + (draft.ask_reason !== false ? 'checked' : '') + '> 二级网页收集「不参会原因」</span>' +
           '<span><input type="checkbox" id="f-ask-note" ' + (draft.ask_note !== false ? 'checked' : '') + '> 二级网页收集「备注」</span>' +
-          '<span><input type="checkbox" id="f-layout" ' + (draft.layout_enabled ? 'checked' : '') + '> 需要会场布局（座位图 + 签到）</span>' +
         '</label>' +
       '</div></div>' +
 
       '<div class="card"><div class="card-h"><h2>选择参会人员</h2>' +
         '<span class="sp" style="flex:1"></span>' +
-        '<span class="tag blue" id="f-count">已选 0 人</span>' +
+        '<button type="button" class="btn sm" id="f-count">已选 0 人</button>' +
       '</div><div class="card-b">' +
-        '<div class="cat-chips" style="margin-bottom:12px" id="f-cats">' +
-          '<button class="btn ghost sm" id="f-cat-all">全选所有类别</button>' +
-          '<button class="btn ghost sm" id="f-cat-none">清空</button>' + catAll +
+        '<div class="filters" style="display:flex;gap:8px;margin-bottom:9px;flex-wrap:wrap">' +
+          '<select class="input" id="f-fdept" style="width:150px">' +
+            '<option value="">全部单位</option>' +
+            Array.from(new Set(ownRoster().map(function (x) { return x.dept || ''; }).filter(Boolean)))
+              .sort().map(function (d) { return '<option value="' + h(d) + '">' + h(d) + '</option>'; }).join('') +
+          '</select>' +
+          '<select class="input" id="f-fcat" style="width:130px">' +
+            '<option value="">全部类别</option>' +
+            availableCategories().map(function (c) { return '<option value="' + h(c) + '">' + h(c) + '</option>'; }).join('') +
+            '<option value="__none">未分类</option>' +
+          '</select>' +
         '</div>' +
-        '<input class="input" id="f-psearch" placeholder="搜索姓名 / 工号 / 部门，快速单独勾选" style="margin-bottom:9px">' +
+        '<input class="input" id="f-psearch" placeholder="模糊搜索：姓名 / 工号 / 部门 / 类别" style="margin-bottom:9px">' +
         '<div class="person-list" id="f-plist"></div>' +
         '<div class="hint">按类别勾选是「整类加入」，也可以搜索后单独挑选。' +
         '参会人名单会以快照方式存进本场会议，以后改名单不影响这场会议。</div>' +
@@ -951,18 +1059,120 @@
     return shell('new', isEdit ? '编辑会议' : '发布会议', '', body);
   }
 
+  /* 已选人员一览：按类别分「已选 / 未选」两栏，点名字互相移动 */
+  function openSelectedList() {
+    var mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML = '<div class="modal" style="max-width:760px"><div class="modal-body" style="white-space:normal">' +
+      '<div class="modal-title" id="sl-title">已选人员</div><div id="sl-body"></div>' +
+      '</div><div class="modal-foot">' +
+      '<button class="btn ghost" data-x="0">取消</button>' +
+      '<button class="btn" data-ok="1">确认选择</button></div></div>';
+    document.body.appendChild(mask);
+
+    // 草稿：弹窗里的改动先记在这里，点「确认」才生效
+    var draft = Object.assign({}, S.selectedInvite);
+
+    function paint() {
+      var all = ownRoster().filter(function (p) { return p.active !== false; });
+      var cats = availableCategories().slice();
+      all.forEach(function (p) {
+        var c = p.category || '未分类';
+        if (cats.indexOf(c) < 0) cats.push(c);
+      });
+
+      var totalSel = 0;
+      var html = cats.map(function (cat) {
+        var list = all.filter(function (p) { return (p.category || '未分类') === cat; });
+        if (!list.length) return '';
+        var sel = list.filter(function (p) { return draft[inviteKey(p)]; });
+        var un = list.filter(function (p) { return !draft[inviteKey(p)]; });
+        totalSel += sel.length;
+
+        function chip(p, on) {
+          return '<button type="button" class="sl-chip' + (on ? ' on' : '') + '" data-key="' + h(inviteKey(p)) + '">' +
+            h(p.name) + '<i>' + h(p.dept || '') + '</i></button>';
+        }
+
+        return '<div class="sl-grp">' +
+          '<div class="sl-hd">' + h(cat) +
+            '<span class="mini">共 ' + list.length + ' 人 · 已选 ' + sel.length + ' 人</span></div>' +
+          '<div class="sl-cols">' +
+            '<div class="sl-col"><div class="sl-col-hd">已选（' + sel.length + '）<span>点击移出</span></div>' +
+              '<div class="sl-list">' + (sel.map(function (p) { return chip(p, true); }).join('') || '<div class="sl-empty">无</div>') + '</div></div>' +
+            '<div class="sl-col"><div class="sl-col-hd">未选（' + un.length + '）<span>点击加入</span></div>' +
+              '<div class="sl-list">' + (un.map(function (p) { return chip(p, false); }).join('') || '<div class="sl-empty">全部已选</div>') + '</div></div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+
+      var t = mask.querySelector('#sl-title');
+      if (t) t.textContent = '已选人员（共 ' + totalSel + ' 人）　点名字调整，点「确认选择」后生效';
+      mask.querySelector('#sl-body').innerHTML = html || '<div class="empty">名单是空的</div>';
+    }
+
+    paint();
+
+    mask.addEventListener('click', function (e) {
+      var chip = e.target.closest('[data-key]');
+      if (chip) {
+        var k = chip.getAttribute('data-key');
+        if (draft[k]) delete draft[k];
+        else draft[k] = true;
+        paint();
+        return;
+      }
+      if (e.target.closest('[data-ok]')) {
+        S.selectedInvite = draft;
+        var n = Object.keys(draft).filter(function (x) { return draft[x]; }).length;
+        mask.remove();
+        toast('已确认：已选 ' + n + ' 人', 'ok');
+        if (openSelectedList._refresh) openSelectedList._refresh();
+        return;
+      }
+      if (e.target.closest('[data-x]') || e.target === mask) mask.remove();
+    });
+  }
+
   function bindForm(editId) {
     var isEdit = !!editId;
+
+    function filteredPeople() {
+      var dEl = q('f-fdept'), cEl = q('f-fcat');
+      var fdept = dEl ? dEl.value : '';
+      var fcat = cEl ? cEl.value : '';
+      var kw = ((q('f-psearch') || {}).value || '').trim().toLowerCase();
+      return ownRoster().filter(function (x) {
+        if (x.active === false) return false;
+        if (fdept && (x.dept || '') !== fdept) return false;
+        if (fcat === '__none') { if (x.category) return false; }
+        else if (fcat && (x.category || '') !== fcat) return false;
+        if (!kw) return true;
+        return (x.name || '').toLowerCase().indexOf(kw) >= 0 ||
+               (x.dept || '').toLowerCase().indexOf(kw) >= 0 ||
+               (String(x.emp_no || '')).toLowerCase().indexOf(kw) >= 0 ||
+               (x.category || '').toLowerCase().indexOf(kw) >= 0;
+      });
+    }
+
+    openSelectedList._refresh = renderPeople;
 
     function renderPeople() {
       var box = q('f-psearch');
       var kw = (box && box.value || '').trim().toLowerCase();
+      var dEl = q('f-fdept'), cEl = q('f-fcat');
+      var fdept = dEl ? dEl.value : '';
+      var fcat = cEl ? cEl.value : '';
       var cats = availableCategories();
       function match(p) {
+        if (fdept && (p.dept || '') !== fdept) return false;
+        if (fcat === '__none') { if (p.category) return false; }
+        else if (fcat && (p.category || '') !== fcat) return false;
         if (!kw) return true;
         return (p.name || '').toLowerCase().indexOf(kw) >= 0 ||
                (p.dept || '').toLowerCase().indexOf(kw) >= 0 ||
-               (String(p.emp_no || '')).toLowerCase().indexOf(kw) >= 0;
+               (String(p.emp_no || '')).toLowerCase().indexOf(kw) >= 0 ||
+               (p.category || '').toLowerCase().indexOf(kw) >= 0;
       }
       function personRow(p) {
         var k = inviteKey(p);
@@ -974,10 +1184,13 @@
           '<span class="dp">' + h(p.dept || '（部门未填）') + '</span>' +
         '</label>';
       }
-      var html = cats.map(function (cat) {
+      var shownCats = fcat ? cats.filter(function (c) { return c === fcat; }) : cats;
+      var html = shownCats.map(function (cat) {
         var list = rosterByCat(cat).filter(match);
         if (!list.length) return '';
-        return '<div class="grp">' + h(cat) + '　<span class="mini">' + list.length + ' 人</span></div>' +
+        return '<div class="grp"><label class="grp-chk">' +
+            '<input type="checkbox" data-grp-cat="' + h(cat) + '"> ' + h(cat) +
+          '</label>　<span class="mini">' + list.length + ' 人</span></div>' +
           list.map(personRow).join('');
       }).join('');
 
@@ -988,21 +1201,16 @@
         html += '<div class="grp">未分类　<span class="mini">' + other.length + ' 人</span></div>' +
           other.map(personRow).join('');
       }
+      renderPeople._shown = filteredPeople();
+
       q('f-plist').innerHTML = html || '<div class="empty">名单是空的，请先到「名单管理」导入人员</div>';
 
-      var catBoxes = document.querySelectorAll('[data-catbox]');
-      cats.forEach(function (cat) {
-        var all = rosterByCat(cat);
-        var cb = null;
-        for (var i = 0; i < catBoxes.length; i++) {
-          if (catBoxes[i].getAttribute('data-catbox') === cat) { cb = catBoxes[i]; break; }
-        }
-        if (!cb) return;
-        var selN = all.filter(function (p) { return S.selectedInvite[inviteKey(p)]; }).length;
-        cb.checked = all.length > 0 && selN === all.length;
-        cb.indeterminate = selN > 0 && selN < all.length;
-        var chip = cb.closest('.cat-chip');
-        if (chip) chip.classList.toggle('on', selN > 0);
+      document.querySelectorAll('[data-grp-cat]').forEach(function (cb) {
+        var cat = cb.getAttribute('data-grp-cat');
+        var grp = rosterByCat(cat).filter(match);
+        var sel = grp.filter(function (x) { return S.selectedInvite[inviteKey(x)]; }).length;
+        cb.checked = grp.length > 0 && sel === grp.length;
+        cb.indeterminate = sel > 0 && sel < grp.length;
       });
 
       var n = Object.keys(S.selectedInvite).filter(function (k) { return S.selectedInvite[k]; }).length;
@@ -1025,27 +1233,33 @@
       S.selectedInvite[box.getAttribute('data-pbox')] = box.checked;
       renderPeople();
     });
+    var plist = q('f-plist');
+    if (plist) plist.addEventListener('change', function (e) {
+      var cb = e.target.closest('[data-grp-cat]');
+      if (!cb) return;
+      var cat = cb.getAttribute('data-grp-cat');
+      var grp = filteredPeople().filter(function (x) { return (x.category || '') === cat; });
+      if (cb.checked) grp.forEach(function (x) { S.selectedInvite[inviteKey(x)] = true; });
+      else grp.forEach(function (x) { delete S.selectedInvite[inviteKey(x)]; });
+      renderPeople();
+      toast((cb.checked ? '已勾选 ' : '已取消 ') + cat + ' ' + grp.length + ' 人', 'ok');
+    });
+
+    var fd = q('f-fdept'), fc = q('f-fcat');
+    if (fd) fd.addEventListener('change', renderPeople);
+    if (fc) fc.addEventListener('change', renderPeople);
+
     q('f-psearch').addEventListener('input', function () {
       var pos = q('f-psearch').selectionStart;
       renderPeople();
       restoreCaret('f-psearch', pos);
     });
-    q('f-cats').addEventListener('change', function (e) {
-      var box = e.target.closest('[data-catbox]');
-      if (!box) return;
-      var cat = box.getAttribute('data-catbox');
-      rosterByCat(cat).forEach(function (p) { S.selectedInvite[inviteKey(p)] = box.checked; });
-      renderPeople();
-    });
-    q('f-cat-all').addEventListener('click', function () {
-      ownRoster().forEach(function (p) { if (p.active !== false) S.selectedInvite[inviteKey(p)] = true; });
-      renderPeople();
-    });
-    q('f-cat-none').addEventListener('click', function () {
-      S.selectedInvite = {};
-      renderPeople();
-    });
+
+    var cntBtn = q('f-count');
+    if (cntBtn) cntBtn.addEventListener('click', openSelectedList);
+
     q('f-save').addEventListener('click', function () { saveMeeting(isEdit, editId); });
+
     renderPeople();
   }
 
@@ -1062,7 +1276,7 @@
       agenda: (q('f-agenda') && q('f-agenda').value) || '',
       ask_reason: !!(q('f-ask-reason') && q('f-ask-reason').checked),
       ask_note: !!(q('f-ask-note') && q('f-ask-note').checked),
-      layout_enabled: !!(q('f-layout') && q('f-layout').checked),
+      layout_enabled: true,   // 默认每场会议都带会场布局（有图就显示，没图则空白）
       deadline: U.fromLocalInput(q('f-deadline') ? q('f-deadline').value : '')
     };
   }
@@ -1101,13 +1315,15 @@
     var btn = q('f-save');
     if (btn) { btn.disabled = true; btn.textContent = '正在保存…'; }
     var p = isEdit ? DB.updateMeeting(editId, payload) : DB.createMeeting(payload);
+
     p.then(function (row) {
       var saved = row && row.id ? row : Object.assign({}, payload, { id: editId });
       return refreshAll().then(function () { return saved; });
     }).then(function (saved) {
       toast(isEdit ? '会议已保存' : '会议已发布', 'ok');
       if (!isEdit) S.detailResponses = [];
-      go('#/meeting/' + ((saved && saved.id) || editId));
+      var sid = (saved && saved.id) || editId;
+      go('#/meeting/' + sid);
     }).catch(function (e) {
       toast('保存失败：' + String(e.message || e), 'err');
       if (btn) { btn.disabled = false; btn.textContent = isEdit ? '保存修改' : '发布会议并生成链接'; }
@@ -1119,7 +1335,7 @@
    * ============================================================ */
   function viewRoster() {
     var f = S.rosterFilter;
-    var isSuper = !!(S.profile && S.profile.is_super);
+    var isSuper = isAdmin();
     var owners = {};
     S.roster.forEach(function (x) { if (x.owner_id) owners[x.owner_id] = x.owner_name || x.owner_emp_no || '未命名'; });
     var list = S.roster.slice().sort(function (a, b) {

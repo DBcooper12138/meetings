@@ -1633,3 +1633,44 @@ begin
   end if;
   return new;
 end $$;
+
+
+-- ============================================================
+-- 22. v2.8 会议回收站（删除后保留 30 天，可恢复/彻底删除）
+-- ============================================================
+create table if not exists public.meetings_trash (
+  id         uuid primary key,
+  owner_id   uuid,
+  title      text not null default '',
+  data       jsonb not null,
+  deleted_at timestamptz not null default now()
+);
+create index if not exists meetings_trash_owner_idx on public.meetings_trash (owner_id, deleted_at desc);
+
+alter table public.meetings_trash enable row level security;
+drop policy if exists trash_owner_all on public.meetings_trash;
+create policy trash_owner_all on public.meetings_trash
+  for all to authenticated
+  using (owner_id = auth.uid() or public.is_super())
+  with check (owner_id = auth.uid() or public.is_super());
+
+-- 恢复会议（并把它从回收站移除）
+create or replace function public.restore_meeting(p_id uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare v_row public.meetings_trash;
+begin
+  select * into v_row from public.meetings_trash where id = p_id;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', '回收站里没有这场会议');
+  end if;
+  if not public.is_super() and v_row.owner_id <> auth.uid() then
+    return jsonb_build_object('ok', false, 'error', '无权恢复');
+  end if;
+  insert into public.meetings select * from jsonb_populate_record(null::public.meetings, v_row.data)
+   on conflict (id) do nothing;
+  delete from public.meetings_trash where id = p_id;
+  return jsonb_build_object('ok', true);
+end $$;
+
+revoke all on function public.restore_meeting(uuid) from public;
+grant execute on function public.restore_meeting(uuid) to authenticated;

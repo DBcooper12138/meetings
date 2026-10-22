@@ -675,19 +675,92 @@
       .then(function (r) { return unwrap(r, '保存会议'); });
   }
 
-  function deleteMeeting(id) {
+  function listTrash() {
     if (!isCloud()) {
       var db = readLocal();
-      db.meetings = db.meetings.filter(function (m) { return m.id !== id; });
-      db.responses = db.responses.filter(function (x) { return x.meeting_id !== id; });
+      var me = db.profile || {};
+      return Promise.resolve((db.trash || []).filter(function (x) {
+        return !x.owner_id || x.owner_id === me.id;
+      }).sort(function (a, b) { return a.deleted_at < b.deleted_at ? 1 : -1; }));
+    }
+    return client().from('meetings_trash').select('*')
+      .order('deleted_at', { ascending: false })
+      .then(function (r) { return unwrap(r, '读取回收站') || []; });
+  }
+
+  function restoreMeeting(id) {
+    if (!isCloud()) {
+      var db = readLocal();
+      var row = (db.trash || []).filter(function (x) { return x.id === id; })[0];
+      if (!row) return Promise.resolve({ ok: false, error: '回收站里没有这场会议' });
+      var m = JSON.parse(JSON.stringify(row.data));
+      db.meetings.push(m);
+      db.trash = db.trash.filter(function (x) { return x.id !== id; });
+      writeLocal(db);
+      return Promise.resolve({ ok: true });
+    }
+    return client().rpc('restore_meeting', { p_id: id })
+      .then(function (r) { return unwrap(r, '恢复会议'); });
+  }
+
+  function purgeMeeting(id) {
+    if (!isCloud()) {
+      var db = readLocal();
+      db.trash = (db.trash || []).filter(function (x) { return x.id !== id; });
       writeLocal(db);
       return Promise.resolve(true);
     }
-    return client().from('meetings').delete().eq('id', id)
-      .then(function (r) { return unwrap(r, '删除会议'); });
+    return client().from('meetings_trash').delete().eq('id', id)
+      .then(function (r) { return unwrap(r, '彻底删除'); });
   }
 
-  /* ================= 回执 ================= */
+  /* 清掉超过 30 天的回收站记录 */
+  function purgeExpired() {
+    var cutoff = new Date(Date.now() - 30 * 86400000).toISOString();
+    if (!isCloud()) {
+      var db = readLocal();
+      db.trash = (db.trash || []).filter(function (x) { return x.deleted_at >= cutoff; });
+      writeLocal(db);
+      return Promise.resolve(true);
+    }
+    return client().from('meetings_trash').delete().lt('deleted_at', cutoff)
+      .then(function () { return true; }).catch(function () { return true; });
+  }
+
+
+  function deleteMeeting(id) {
+    function moveToTrash(row) {
+      if (isCloud()) {
+        return client().from('meetings_trash')
+          .upsert({ id: row.id, owner_id: row.owner_id, title: row.title, data: row,
+                    deleted_at: new Date().toISOString() }, { onConflict: 'id' })
+          .then(function () { return client().from('meetings').delete().eq('id', id); })
+          .then(function () { return true; });
+      }
+      var db = readLocal();
+      db.trash = db.trash || [];
+      db.trash.push({ id: row.id, owner_id: row.owner_id, title: row.title,
+        data: JSON.parse(JSON.stringify(row)), deleted_at: nowISO() });
+      db.meetings = (db.meetings || []).filter(function (x) { return x.id !== id; });
+      db.responses = (db.responses || []).filter(function (x) { return x.meeting_id !== id; });
+      writeLocal(db);
+      return Promise.resolve(true);
+    }
+
+    if (!isCloud()) {
+      var db = readLocal();
+      var row = (db.meetings || []).filter(function (x) { return x.id === id; })[0];
+      if (!row) return Promise.resolve(true);
+      return moveToTrash(row);
+    }
+    return client().from('meetings').select('*').eq('id', id).maybeSingle()
+      .then(function (r) {
+        var row = unwrap(r, '读取会议');
+        if (!row) return true;
+        return moveToTrash(row);
+      });
+  }
+
   function listResponses(meetingId) {
     if (!isCloud()) {
       var db = readLocal();
@@ -1267,7 +1340,7 @@
     purchasePlan: purchasePlan, requestRecharge: requestRecharge, listMyRecharges: listMyRecharges,
     listRoster: listRoster, insertRoster: insertRoster, updateRoster: updateRoster, deleteRoster: deleteRoster,
     quotaStatus: quotaStatus, consumeQuota: consumeQuota, promoteResponse: promoteResponse,
-    listMeetings: listMeetings, getMeeting: getMeeting, createMeeting: createMeeting,
+    listMeetings: listMeetings, listTrash: listTrash, restoreMeeting: restoreMeeting, purgeMeeting: purgeMeeting, purgeExpired: purgeExpired, getMeeting: getMeeting, createMeeting: createMeeting,
     updateMeeting: updateMeeting, deleteMeeting: deleteMeeting,
     listResponses: listResponses, listAllResponses: listAllResponses, deleteResponse: deleteResponse,
     getLayout: getLayout, saveLayout: saveLayout,

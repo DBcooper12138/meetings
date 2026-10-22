@@ -225,30 +225,41 @@
     var seatCount = L.seats.length;
 
     var toolbar =
-      '<div class="btn-row" style="margin-bottom:12px;flex-wrap:wrap">' +
-        '<button class="btn ghost sm" data-go="#/meeting/' + h(mid) + '">← 返回会议</button>' +
-        '<span class="sp" style="flex:1"></span>' +
-        '<button class="btn ' + (isFree ? 'ghost' : '') + ' sm" data-mode="grid">排座式</button>' +
-        '<button class="btn ' + (isFree ? '' : 'ghost') + ' sm" data-mode="free">自由布局</button>' +
-        '<span style="width:10px"></span>' +
-        '<button class="btn ghost sm" id="ly-config">⚙ 排座参数</button>' +
-        '<select class="input" id="ly-fill-mode" style="width:132px;padding:4px 8px;font-size:12.5px">' +
+      // 第一行：会场整体设置
+      '<div class="ly-tools">' +
+        '<div class="ly-seg">' +
+          '<button class="' + (isFree ? '' : 'on') + '" data-mode="grid">排座式</button>' +
+          '<button class="' + (isFree ? 'on' : '') + '" data-mode="free">自由布局</button>' +
+        '</div>' +
+        '<button class="ly-tbtn" id="ly-config">会场布局</button>' +
+        '<button class="ly-tbtn' + (E.zoneMode ? ' active' : '') + '" id="ly-zone-mode">划分区域</button>' +
+        '<button class="ly-tbtn" id="ly-size">参数调整</button>' +
+        '<span class="ly-gap"></span>' +
+        '<button class="ly-tbtn primary" id="ly-save">保存布局</button>' +
+        '<button class="ly-tbtn" id="ly-tpl-save">存为模板</button>' +
+        '<button class="ly-tbtn" id="ly-tpl-use">套用模板</button>' +
+      '</div>' +
+
+      // 第二行：排座与座位操作
+      '<div class="ly-tools ly-tools-2">' +
+        '<select class="ly-select" id="ly-fill-mode">' +
           ['order:顺序排座', 'category:按类别分区', 'dept:按单位分区', 'random:随机排座'].map(function (x) {
             var kv = x.split(':');
             return '<option value="' + kv[0] + '"' +
               ((E.fillMode || 'order') === kv[0] ? ' selected' : '') + '>' + kv[1] + '</option>';
           }).join('') +
         '</select>' +
-        '<button class="btn sm" id="ly-autofill">开始排座</button>' +
-        '<button class="btn ghost sm" id="ly-clear">清空安排</button>' +
-        '<button class="btn ghost sm" id="ly-zone-mode">划分区域</button>' +
-        '<button class="btn ghost sm" id="ly-size">座位大小</button>' +
-        '<button class="btn ghost sm" id="ly-del-seat">删除座位</button>' +
-        '<button class="btn ghost sm" id="ly-unassign">清空该座</button>' +
-        '<button class="btn ghost sm" id="ly-tpl-save">☆ 存为模板</button>' +
-        '<button class="btn ghost sm" id="ly-tpl-use">套用模板</button>' +
-        '<button class="btn ghost sm" id="ly-save">💾 保存布局</button>' +
-      '</div>';
+        '<button class="ly-tbtn primary" id="ly-autofill">开始排座</button>' +
+        '<button class="ly-tbtn" id="ly-add-seat">增加座位</button>' +
+        '<button class="ly-tbtn" id="ly-del-seat">删除座位</button>' +
+        '<button class="ly-tbtn" id="ly-unassign">清空该座信息</button>' +
+        '<span class="ly-gap"></span>' +
+        '<button class="ly-tbtn muted" id="ly-clear">清空排座</button>' +
+      '</div>' +
+      '<div class="ly-toolbar-note">' +
+        '<button class="ly-back" data-go="#/meeting/' + h(mid) + '">← 返回会议</button>' +
+        '<span id="ly-tip">划分区域：拖拽画框选中座位 → 上方选分区 → 应用</span>' +
+      '</div>'
 
     var left =
       '<div class="ly-side">' +
@@ -463,9 +474,9 @@
       var start = null, box = null;
       canvas.addEventListener('pointerdown', function (e) {
         if (!E.zoneMode) return;
-        if (e.target.closest('[data-seat]')) return;
         var r = canvas.getBoundingClientRect();
         start = { x: (e.clientX - r.left) / E.zoom, y: (e.clientY - r.top) / E.zoom };
+        canvas.querySelectorAll('.ly-marquee').forEach(function (x) { x.remove(); });
         box = document.createElement('div');
         box.className = 'ly-marquee';
         canvas.appendChild(box);
@@ -491,6 +502,13 @@
         E.zoneSel = hit;
         MS().render();
       });
+      // 兜底：指针在画布外松开时也能收尾
+      if (!enableMarquee._docUp) {
+        enableMarquee._docUp = true;
+        document.addEventListener('pointerup', function () {
+          document.querySelectorAll('.ly-marquee').forEach(function (x) { x.remove(); });
+        });
+      }
     }
 
     var delSeat = q('ly-del-seat');
